@@ -1,0 +1,10 @@
+ps -p 1 -o comm=
+
+command -v docker || echo "docker CLI not found"
+command -v dockerd || echo "dockerd not found"
+
+dpkg -l | egrep 'docker|containerd' || true
+
+systemctl list-unit-files | grep -i docker || true
+
+command -v snap >/dev/null && snap list | grep -i docker || true
