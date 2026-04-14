@@ -1,0 +1,70 @@
+# Stretch Fruit Finder — Configuration
+# All tunable parameters in one place.
+
+robot:
+  head_camera_height_m: 1.1        # Height of D435i above floor (meters)
+  robot_radius_m: 0.18             # Robot footprint radius for obstacle inflation
+
+camera:
+  width: 640
+  height: 480
+  fps: 15
+  depth_scale: 0.001               # RealSense depth units to meters
+  min_depth_m: 0.3
+  max_depth_m: 5.0
+  rotated_90: false                 # Set true if D435i is mounted rotated 90 degrees
+
+detection:
+  model: "yolov8n.pt"              # yolov8n (fastest) or yolov8s (better accuracy)
+  openvino_model: "yolov8n_openvino_model"  # Directory created by one-time export
+  use_openvino: true               # Export to OpenVINO for faster CPU inference
+  confidence: 0.45
+  infer_every_n_frames: 3          # Run YOLO every N camera frames
+  food_classes: [46, 47, 48, 49, 50, 51, 52, 53, 54, 55]
+  kitchen_classes: [39, 41, 43, 44, 45, 60, 68, 69, 70, 71, 72]
+
+navigation:
+  search_pan_min_rad: -1.5         # Head pan sweep start
+  search_pan_max_rad: 1.5          # Head pan sweep end
+  search_pan_step_rad: 0.3         # Head pan increment per step
+  search_tilt_rad: -0.6            # Head tilt during search (negative = look down)
+  search_pause_sec: 0.5            # Pause at each pan step for detection
+  approach_stop_distance_m: 0.55   # Stop this far from target
+  obstacle_min_distance_m: 0.5     # Minimum clear distance ahead
+  explore_rotate_rad: 1.05         # ~60 degrees rotation when exploring
+  explore_translate_m: 0.4         # Forward step when exploring
+  max_search_sweeps: 3             # Full head sweeps before giving up in one location
+  max_explore_steps: 5             # Explore attempts before returning to IDLE
+  use_map: false                   # Set true and provide map_file for map-based nav
+  map_file: ""                     # Path to .npz map file
+  grid_resolution_m: 0.05          # Occupancy grid cell size
+
+arm:
+  height_above_object_m: 0.15      # How far above the object to position the gripper
+  max_extension_m: 0.5             # Maximum arm extension
+  min_lift_m: 0.05                 # Minimum lift height
+  max_lift_m: 1.05                 # Maximum lift height
+  stow_lift_m: 0.8                 # Lift height when stowed
+  stow_arm_m: 0.0                  # Arm extension when stowed
+  stow_wrist_yaw: 0.0
+  stow_wrist_pitch: -0.5
+  stow_wrist_roll: 0.0
+  search_lift_m: 0.8               # Lift height during search
+  reach_wrist_pitch: -1.57         # Wrist pitch when reaching (point down)
+
+gamepad:
+  toggle_button: 7                 # Start button — toggle AUTO/MANUAL
+  arm_button: 0                    # A button — trigger arm positioning
+  stow_button: 1                   # B button — stow arm
+  search_button: 3                 # Y button — start search from MANUAL
+  stop_button: 6                   # Back button — emergency stop
+  deadzone: 0.15                   # Axis deadzone threshold
+  base_translate_speed: 0.1        # Meters per gamepad tick
+  base_rotate_speed: 0.15          # Radians per gamepad tick
+  head_pan_speed: 0.05             # Radians per gamepad tick
+  head_tilt_speed: 0.05            # Radians per gamepad tick
+
+gui:
+  update_interval_ms: 33           # ~30 FPS GUI refresh
+  log_max_lines: 200               # Maximum lines in the log panel
+  window_title: "Stretch Fruit Finder"

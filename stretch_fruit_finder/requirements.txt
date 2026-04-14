@@ -1,0 +1,31 @@
+# Stretch Fruit Finder — Python Dependencies
+# Install on the Stretch RE2 NUC:
+#   pip install -r requirements.txt
+
+# Robot hardware control (likely already installed)
+stretch-body>=0.6
+
+# Intel RealSense camera (likely already installed)
+pyrealsense2>=2.50
+
+# YOLOv8 object detection (installs PyTorch CPU automatically)
+ultralytics>=8.0
+
+# Intel OpenVINO for faster YOLO inference on Intel CPUs
+openvino>=2023.0
+
+# Numerical / scientific
+numpy<2
+scipy
+
+# Configuration
+pyyaml
+
+# Gamepad input
+pygame
+
+# Image conversion for tkinter display
+Pillow
+
+# Image manipulation (headless — GUI uses tkinter, not OpenCV highgui)
+opencv-python-headless
