@@ -2,11 +2,19 @@
 # Install on the Stretch RE2 NUC:
 #   pip install -r requirements.txt
 
-# Robot hardware control (likely already installed)
-stretch-body>=0.6
+# Robot hardware control — provided by Hello Robot's base install on the
+# Stretch RE2 image. Do NOT pip-install this here:
+#   - `stretch-body` is not a valid PyPI name (pip will fail with
+#     "no matching distribution"). The real PyPI name is
+#     `hello-robot-stretch-body`, and the Python import is `stretch_body`.
+#   - On a healthy robot, stretch_body is already set up by Hello Robot.
+# Verify with: python3 -c "import stretch_body; print(stretch_body.__version__)"
+# stretch-body>=0.6
 
-# Intel RealSense camera (likely already installed)
-pyrealsense2>=2.50
+# Intel RealSense camera — ships with the RealSense SDK on the robot.
+# Do NOT pip-install from here; use the robot image's existing copy.
+# Verify with: python3 -c "import pyrealsense2 as rs; print('pyrealsense2 OK')"
+# pyrealsense2>=2.50
 
 # YOLOv8 object detection (installs PyTorch CPU automatically)
 ultralytics>=8.0
