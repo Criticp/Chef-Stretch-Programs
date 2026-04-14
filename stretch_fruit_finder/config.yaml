@@ -39,6 +39,15 @@ navigation:
   map_file: ""                     # Path to .npz map file
   grid_resolution_m: 0.05          # Occupancy grid cell size
 
+tracking:
+  kp: 0.4                          # Proportional gain (fraction of radian error to correct per step)
+  target_conf_min: 0.40            # Min detection confidence to keep tracking
+  sweep_acquire_conf_min: 0.50     # Min detection confidence to EXIT sweep and start tracking
+  lost_frames_timeout: 20          # Frames without target before we give up and re-sweep
+  max_step_rad: 0.25               # Max pan/tilt correction per iteration (caps jerkiness)
+  pan_sign: -1                     # Flip to +1 if the head tracks the wrong way horizontally
+  tilt_sign: -1                    # Flip to +1 if the head tracks the wrong way vertically
+
 arm:
   height_above_object_m: 0.15      # How far above the object to position the gripper
   max_extension_m: 0.5             # Maximum arm extension
