@@ -42,13 +42,16 @@ PoseCallback = Optional[Callable[[np.ndarray, list, float, float], None]]
 @dataclass
 class TrackerParams:
     """Runtime tunables. Loaded from config.yaml `tracking:` section with defaults."""
-    kp: float = 0.4
-    target_conf_min: float = 0.40
+    kp: float = 0.35
+    target_conf_min: float = 0.30
     sweep_acquire_conf_min: float = 0.50
-    lost_frames_timeout: int = 20
-    max_step_rad: float = 0.25
+    lost_frames_timeout: int = 45
+    max_step_rad: float = 0.15
     pan_sign: float = -1.0
     tilt_sign: float = -1.0
+    auto_sign_flip: bool = True
+    settle_sleep_s: float = 0.05
+    verbose_first_n: int = 8
 
     @classmethod
     def from_config(cls, config: dict) -> "TrackerParams":
@@ -66,6 +69,9 @@ class TrackerParams:
             max_step_rad=float(trk.get("max_step_rad", defaults.max_step_rad)),
             pan_sign=float(trk.get("pan_sign", defaults.pan_sign)),
             tilt_sign=float(trk.get("tilt_sign", defaults.tilt_sign)),
+            auto_sign_flip=bool(trk.get("auto_sign_flip", defaults.auto_sign_flip)),
+            settle_sleep_s=float(trk.get("settle_sleep_s", defaults.settle_sleep_s)),
+            verbose_first_n=int(trk.get("verbose_first_n", defaults.verbose_first_n)),
         )
 
 
@@ -259,6 +265,12 @@ def track(
     chain continuously. Exits when stop_event is set or when the target is
     lost for more than `lost_frames_timeout` consecutive frames.
 
+    First iteration is a "probe": command a small fraction-size correction
+    with the configured signs. Second iteration checks whether the error
+    actually shrank; if it grew, auto-flip the offending sign so the rest
+    of the tracker converges instead of diverging. This pays for itself
+    the first time a user runs against a differently-mounted head.
+
     Returns a short reason string: "stopped", "lost", or "error".
     """
     tp = params or TrackerParams.from_config(config)
@@ -266,13 +278,19 @@ def track(
     rpp_x, rpp_y = rad_per_pixel(cam)
     logger.info(
         "track: kp=%.2f max_step=%.2f lost_timeout=%d pan_sign=%+d tilt_sign=%+d "
-        "rad_per_px=(%.5f, %.5f)",
+        "rad_per_px=(%.5f, %.5f) auto_sign_flip=%s settle=%.3fs",
         tp.kp, tp.max_step_rad, tp.lost_frames_timeout, int(tp.pan_sign), int(tp.tilt_sign),
-        rpp_x, rpp_y,
+        rpp_x, rpp_y, tp.auto_sign_flip, tp.settle_sleep_s,
     )
 
     lost_frames = 0
     reason = "stopped"
+    iteration = 0
+
+    # State carried across iterations for the probe / sign check.
+    probe_done = not tp.auto_sign_flip
+    probe_err_before: tuple[float, float] | None = None
+    probe_delta: tuple[float, float] = (0.0, 0.0)
 
     while not stop_event.is_set():
         color, _depth = cam.get_frames()
@@ -293,10 +311,16 @@ def track(
 
         if target is None:
             lost_frames += 1
+            if iteration < tp.verbose_first_n:
+                logger.info(
+                    "track[%02d]: no target (lost_frames=%d/%d)",
+                    iteration, lost_frames, tp.lost_frames_timeout,
+                )
             if lost_frames >= tp.lost_frames_timeout:
                 logger.info("track: target lost for %d frames; exiting", lost_frames)
                 reason = "lost"
                 break
+            iteration += 1
             continue
 
         lost_frames = 0
@@ -308,20 +332,88 @@ def track(
         err_x_rad = err_x_px * rpp_x
         err_y_rad = err_y_px * rpp_y
 
-        delta_pan = tp.pan_sign * tp.kp * err_x_rad
-        delta_tilt = tp.tilt_sign * tp.kp * err_y_rad
+        # --- sign verification phase ---
+        if not probe_done and probe_err_before is not None:
+            # We commanded a move on the previous iteration. Did error shrink?
+            # Only check an axis if we commanded a non-trivial move on it AND
+            # the old error was large enough to be meaningful.
+            eps = 0.02  # rad — ignore noise below this
+            moved_x = abs(probe_delta[0]) > 1e-3
+            moved_y = abs(probe_delta[1]) > 1e-3
+            old_x, old_y = probe_err_before
 
-        delta_pan = clamp(delta_pan, -tp.max_step_rad, tp.max_step_rad)
-        delta_tilt = clamp(delta_tilt, -tp.max_step_rad, tp.max_step_rad)
+            if moved_x and abs(old_x) > eps:
+                if abs(err_x_rad) > abs(old_x) + eps:
+                    tp.pan_sign = -tp.pan_sign
+                    logger.warning(
+                        "track: AUTO-FLIPPED pan_sign to %+d "
+                        "(err_x %.3f -> %.3f rad)",
+                        int(tp.pan_sign), old_x, err_x_rad,
+                    )
+                else:
+                    logger.info(
+                        "track: pan_sign %+d OK (err_x %.3f -> %.3f rad)",
+                        int(tp.pan_sign), old_x, err_x_rad,
+                    )
+            if moved_y and abs(old_y) > eps:
+                if abs(err_y_rad) > abs(old_y) + eps:
+                    tp.tilt_sign = -tp.tilt_sign
+                    logger.warning(
+                        "track: AUTO-FLIPPED tilt_sign to %+d "
+                        "(err_y %.3f -> %.3f rad)",
+                        int(tp.tilt_sign), old_y, err_y_rad,
+                    )
+                else:
+                    logger.info(
+                        "track: tilt_sign %+d OK (err_y %.3f -> %.3f rad)",
+                        int(tp.tilt_sign), old_y, err_y_rad,
+                    )
+            probe_done = True
+
+        # --- compute correction ---
+        # Use a smaller gain on the probe iteration so a wrong sign can't
+        # swing the head hard enough to lose the target before we detect it.
+        probing_now = (not probe_done) and probe_err_before is None
+        kp_eff = tp.kp * 0.4 if probing_now else tp.kp
+        step_eff = tp.max_step_rad * 0.5 if probing_now else tp.max_step_rad
+
+        delta_pan = tp.pan_sign * kp_eff * err_x_rad
+        delta_tilt = tp.tilt_sign * kp_eff * err_y_rad
+        delta_pan = clamp(delta_pan, -step_eff, step_eff)
+        delta_tilt = clamp(delta_tilt, -step_eff, step_eff)
 
         new_pan = clamp(real_pan + delta_pan, limits.pan_lo, limits.pan_hi)
         new_tilt = clamp(real_tilt + delta_tilt, limits.tilt_lo, limits.tilt_hi)
 
-        # Only issue a move if we're actually asking for something new.
+        if iteration < tp.verbose_first_n:
+            logger.info(
+                "track[%02d]%s: pos=(%+.2f, %+.2f) err_rad=(%+.3f, %+.3f) "
+                "delta=(%+.3f, %+.3f) new=(%+.2f, %+.2f) conf=%.2f",
+                iteration,
+                " PROBE" if probing_now else "",
+                real_pan, real_tilt,
+                err_x_rad, err_y_rad,
+                delta_pan, delta_tilt,
+                new_pan, new_tilt,
+                target.confidence,
+            )
+
+        # Record what we commanded so the next iteration can check it.
+        if probing_now:
+            probe_err_before = (err_x_rad, err_y_rad)
+            probe_delta = (delta_pan, delta_tilt)
+
+        # --- command the move ---
         if abs(new_pan - real_pan) > 1e-3:
             robot.head.move_to("head_pan", new_pan)
         if abs(new_tilt - real_tilt) > 1e-3:
             robot.head.move_to("head_tilt", new_tilt)
         # No wait_command() — continuous update.
+
+        # Brief settle so the next detector frame isn't motion-blurred.
+        if tp.settle_sleep_s > 0:
+            time.sleep(tp.settle_sleep_s)
+
+        iteration += 1
 
     return reason
