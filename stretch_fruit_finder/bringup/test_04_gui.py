@@ -506,9 +506,12 @@ class FruitFinderGUI:
 
 
 def main() -> int:
+    # force=True because ultralytics.YOLO reconfigures the root logger when
+    # it loads, suppressing our INFO output. force=True re-establishes it.
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+        force=True,
     )
     config_path = _PKG_ROOT / "config.yaml"
     with config_path.open("r") as f:
@@ -530,6 +533,8 @@ def main() -> int:
         print(f"ERROR: detector load failed: {exc}", file=sys.stderr)
         cam.stop()
         return 1
+    # Ultralytics silently lowers the root logger; re-raise it so our INFO logs print.
+    logging.getLogger().setLevel(logging.INFO)
 
     try:
         import stretch_body.robot as sb_robot
