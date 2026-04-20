@@ -65,8 +65,12 @@ if str(_HERE) not in sys.path:
     sys.path.insert(0, str(_HERE))
 
 from fruit_finder.camera import CameraManager  # noqa: E402
-from fruit_finder.detector import Detection, FoodDetector  # noqa: E402
+from fruit_finder.detector import COCO_FOOD_NAMES, Detection, FoodDetector  # noqa: E402
 import _core  # noqa: E402
+
+
+# Shown in the target dropdown to select any-food mode.
+ANY_FOOD_OPTION = "(any food)"
 
 
 # ----- worker -------------------------------------------------------------
@@ -194,6 +198,7 @@ class Worker(threading.Thread):
                     continue
 
                 target_det, acq_pan, acq_tilt = result
+                self.event_q.put(("acquired_label", target_det.label))
                 self.event_q.put(
                     ("log", f"ACQUIRED {target_det.label!r} at pan={acq_pan:+.2f}, "
                      f"tilt={acq_tilt:+.2f} conf={target_det.confidence:.2f}")
@@ -310,10 +315,22 @@ class FruitFinderGUI:
 
         target_frame = ttk.LabelFrame(right, text="Target", padding=6)
         target_frame.grid(row=0, column=0, sticky="ew", pady=(0, 6))
-        ttk.Label(target_frame, text="Food label:").grid(row=0, column=0, sticky="w")
+        ttk.Label(target_frame, text="What to find:").grid(row=0, column=0, sticky="w")
+
+        # Build the dropdown from the detector's known food labels, with
+        # "(any food)" at the top as an explicit option. Staying in sync
+        # with COCO_FOOD_NAMES means adding a new food class to the
+        # detector automatically adds it to this list.
+        target_options = [ANY_FOOD_OPTION] + sorted(COCO_FOOD_NAMES.values())
         self.target_var = tk.StringVar(value="apple")
-        self.target_entry = ttk.Entry(target_frame, textvariable=self.target_var, width=18)
-        self.target_entry.grid(row=1, column=0, sticky="ew", pady=(2, 4))
+        self.target_combo = ttk.Combobox(
+            target_frame,
+            textvariable=self.target_var,
+            values=target_options,
+            state="readonly",
+            width=18,
+        )
+        self.target_combo.grid(row=1, column=0, sticky="ew", pady=(2, 4))
         self.set_target_btn = ttk.Button(
             target_frame, text="Set target", command=self._on_set_target
         )
@@ -343,28 +360,39 @@ class FruitFinderGUI:
         self.pose_label.grid(row=1, column=0, sticky="w")
         self.fps_label = ttk.Label(status_frame, text="FPS: 0.0")
         self.fps_label.grid(row=2, column=0, sticky="w")
-        self.target_label = ttk.Label(status_frame, text="Target: apple")
-        self.target_label.grid(row=3, column=0, sticky="w")
+        self.target_status_label = ttk.Label(status_frame, text="Target: apple")
+        self.target_status_label.grid(row=3, column=0, sticky="w")
+        self.locked_status_label = ttk.Label(status_frame, text="Locked: —")
+        self.locked_status_label.grid(row=4, column=0, sticky="w")
 
     # ----- events ---------------------------------------------------------
 
+    def _ui_value_to_target(self, value: str) -> tuple[str, str]:
+        """
+        Translate a dropdown value into (detector_arg, display_text).
+
+        ANY_FOOD_OPTION maps to "" (the detector's any-food sentinel).
+        A specific label maps to itself, lowercased.
+        """
+        v = (value or "").strip()
+        if v == ANY_FOOD_OPTION or v == "":
+            return ("", ANY_FOOD_OPTION)
+        return (v.lower(), v.lower())
+
     def _on_set_target(self) -> None:
-        target = self.target_var.get().strip().lower()
-        if not target:
-            self._log("Target cannot be empty.")
-            return
-        self.detector.set_target(target)
-        self.target_label.configure(text=f"Target: {target}")
-        self._log(f"Target set to {target!r}")
+        detector_arg, display = self._ui_value_to_target(self.target_var.get())
+        self.detector.set_target(detector_arg)
+        self.target_status_label.configure(text=f"Target: {display}")
+        self.locked_status_label.configure(text="Locked: —")
+        self._log(f"Target set to {display}")
 
     def _on_start(self) -> None:
-        target = self.target_var.get().strip().lower()
-        if not target:
-            self._log("Set a target first.")
-            return
-        self.detector.set_target(target)
-        self.command_q.put(("start", target))
-        self._log(f"Starting search for {target!r}")
+        detector_arg, display = self._ui_value_to_target(self.target_var.get())
+        self.detector.set_target(detector_arg)
+        self.target_status_label.configure(text=f"Target: {display}")
+        self.locked_status_label.configure(text="Locked: —")
+        self.command_q.put(("start", detector_arg))
+        self._log(f"Starting search for {display}")
 
     def _on_stop(self) -> None:
         self.command_q.put(("stop",))
@@ -398,6 +426,10 @@ class FruitFinderGUI:
             elif kind == "state":
                 self._state_name = evt[1]
                 self.state_label.configure(text=f"State: {self._state_name}")
+                if self._state_name == "IDLE":
+                    self.locked_status_label.configure(text="Locked: —")
+            elif kind == "acquired_label":
+                self.locked_status_label.configure(text=f"Locked: {evt[1]}")
             elif kind == "log":
                 self._log(evt[1])
 

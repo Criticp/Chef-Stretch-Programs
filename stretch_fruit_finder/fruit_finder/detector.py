@@ -154,10 +154,28 @@ class FoodDetector:
 
         logger.info("YOLO model loaded successfully")
 
-    def set_target(self, label: str) -> None:
-        """Set the food item name to search for (e.g., 'apple', 'banana')."""
-        self._target_label = label.lower().strip() if label else None
-        logger.info("Detection target set to: %s", self._target_label)
+    def set_target(self, label) -> None:
+        """
+        Set the food item name to search for.
+
+        Pass a specific label (e.g. 'apple', 'banana') to target only that
+        label. Pass None, an empty string, or 'any' / '(any)' / 'any food'
+        to treat EVERY food-class detection as a target (used by the
+        sweep's "any food" mode, which narrows to a specific label after
+        the first acquisition).
+        """
+        if label is None:
+            self._target_label = None
+            logger.info("Detection target cleared")
+            return
+        normalised = str(label).strip().lower()
+        if normalised in ("", "any", "any food", "(any)", "(any food)", "*"):
+            # Empty-string sentinel means "any food-class detection counts".
+            self._target_label = ""
+            logger.info("Detection target: (any food)")
+        else:
+            self._target_label = normalised
+            logger.info("Detection target: %r", self._target_label)
 
     @property
     def target_label(self) -> Optional[str]:
@@ -189,11 +207,14 @@ class FoodDetector:
 
             is_food = class_id in self._food_classes
             is_kitchen = class_id in self._kitchen_classes
-            is_target = (
-                is_food
-                and self._target_label is not None
-                and self._target_label in label
-            )
+            if is_food and self._target_label is not None:
+                if self._target_label == "":
+                    # "any food" mode — every food detection is a candidate
+                    is_target = True
+                else:
+                    is_target = self._target_label in label
+            else:
+                is_target = False
 
             det = Detection(
                 x1=int(x1),

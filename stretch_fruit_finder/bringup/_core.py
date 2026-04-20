@@ -42,16 +42,17 @@ PoseCallback = Optional[Callable[[np.ndarray, list, float, float], None]]
 @dataclass
 class TrackerParams:
     """Runtime tunables. Loaded from config.yaml `tracking:` section with defaults."""
-    kp: float = 0.5
+    kp: float = 0.6
     target_conf_min: float = 0.25
     sweep_acquire_conf_min: float = 0.50
     lost_frames_timeout: int = 30
-    max_step_rad: float = 0.08
+    max_step_rad: float = 0.18
     deadband_rad: float = 0.05
     pan_sign: float = -1.0
     tilt_sign: float = -1.0
     auto_sign_flip: bool = True
-    stable_frames_drain: int = 3
+    stable_frames_drain: int = 2
+    wait_command_in_track: bool = False
     verbose_first_n: int = 10
 
     @classmethod
@@ -74,6 +75,9 @@ class TrackerParams:
             auto_sign_flip=bool(trk.get("auto_sign_flip", defaults.auto_sign_flip)),
             stable_frames_drain=int(
                 trk.get("stable_frames_drain", defaults.stable_frames_drain)
+            ),
+            wait_command_in_track=bool(
+                trk.get("wait_command_in_track", defaults.wait_command_in_track)
             ),
             verbose_first_n=int(trk.get("verbose_first_n", defaults.verbose_first_n)),
         )
@@ -195,9 +199,14 @@ def sweep_until_target(
     max_sweeps = int(nav.get("max_search_sweeps", 3))
 
     detector.set_target(target_label)
+    # detector.target_label == "" means "any food" — in that case we'll
+    # narrow to the specific acquired label once sweep finds something,
+    # so track() stays locked on one item instead of jumping between them.
+    any_food_mode = detector.target_label == ""
     logger.info(
-        "sweep: target=%r pan=[%+.2f,%+.2f] step=%+.2f tilt=%+.2f dwell=%.2f max_sweeps=%d",
-        target_label, pan_min, pan_max, pan_step, tilt_target, dwell, max_sweeps,
+        "sweep: target=%s pan=[%+.2f,%+.2f] step=%+.2f tilt=%+.2f dwell=%.2f max_sweeps=%d",
+        "(any food)" if any_food_mode else repr(target_label),
+        pan_min, pan_max, pan_step, tilt_target, dwell, max_sweeps,
     )
 
     # Move to search tilt + center pan before the sweep.
@@ -243,6 +252,13 @@ def sweep_until_target(
 
             target = pick_target(detections, tp.sweep_acquire_conf_min)
             if target is not None:
+                if any_food_mode:
+                    # Lock the detector onto this specific label for track().
+                    detector.set_target(target.label)
+                    logger.info(
+                        "sweep: narrowed target from (any food) to %r",
+                        target.label,
+                    )
                 logger.info(
                     "sweep: acquired %r at pan=%+.2f tilt=%+.2f conf=%.2f",
                     target.label, real_pan, real_tilt, target.confidence,
@@ -429,7 +445,7 @@ def track(
             robot.head.move_to("head_tilt", new_tilt)
             moved_any = True
 
-        if moved_any:
+        if moved_any and tp.wait_command_in_track:
             try:
                 robot.wait_command()
             except Exception as exc:
