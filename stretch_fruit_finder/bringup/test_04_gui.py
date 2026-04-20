@@ -311,10 +311,9 @@ class FruitFinderGUI:
 
         self._build_layout()
         self._log(
-            "GUI ready. Set a target and press Start search. "
-            "W/A/S/D (or arrows) drive the base; I/K/J/L drive lift+arm; "
-            "U/O = wrist yaw; Y/H = wrist pitch; N/M = wrist roll; "
-            "[ / ] = gripper close/open; X = stow arm."
+            "GUI ready. See the Controls panel on the right for every "
+            "keybinding. Click the video area first so keystrokes reach "
+            "the robot."
         )
         self.root.after(self.update_interval_ms, self._poll_events)
         self.root.after(250, self._poll_slow)
@@ -423,6 +422,92 @@ class FruitFinderGUI:
         self.arm_status_label.grid(row=7, column=0, sticky="w")
         self.arm_pose_label = ttk.Label(status_frame, text="Lift/Arm: — / —")
         self.arm_pose_label.grid(row=8, column=0, sticky="w")
+
+        # ----- Controls reference panel ---------------------------------
+        # Persistent reference so users can see every keybinding without
+        # digging through docs. Grouped by subsystem; key columns use
+        # a fixed-width font so the two-column table stays aligned.
+        controls_frame = ttk.LabelFrame(right, text="Controls", padding=6)
+        controls_frame.grid(row=3, column=0, sticky="ew", pady=(6, 0))
+        self._build_controls_reference(controls_frame)
+
+    # ----- controls reference --------------------------------------------
+
+    # Group label, followed by a list of (key, action) rows. Order matters —
+    # this is how it renders in the GUI.
+    _CONTROLS_SECTIONS = [
+        ("Tracker", [
+            ("Start search",  "Dropdown + button"),
+            ("Stop",          "Button"),
+            ("Stow arm",      "Button or X"),
+            ("Quit",          "Button or window X"),
+        ]),
+        ("Base", [
+            ("W  /  \u2191",  "Translate forward"),
+            ("S  /  \u2193",  "Translate backward"),
+            ("A  /  \u2190",  "Rotate left  (CCW)"),
+            ("D  /  \u2192",  "Rotate right (CW)"),
+        ]),
+        ("Arm + lift", [
+            ("I",  "Lift up"),
+            ("K",  "Lift down"),
+            ("J",  "Arm retract"),
+            ("L",  "Arm extend"),
+        ]),
+        ("Wrist", [
+            ("U  /  O",  "Yaw   CCW / CW"),
+            ("Y  /  H",  "Pitch up  / down"),
+            ("N  /  M",  "Roll  CCW / CW"),
+        ]),
+        ("Gripper", [
+            ("[",  "Close"),
+            ("]",  "Open"),
+        ]),
+        ("Emergency", [
+            ("Ctrl+C (terminal)",  "Clean shutdown"),
+            ("Gamepad Back",       "Same as Ctrl+C"),
+        ]),
+    ]
+
+    def _build_controls_reference(self, parent: ttk.Frame) -> None:
+        """Render the controls legend inside the given frame."""
+        row = 0
+        header_font = ("TkDefaultFont", 9, "bold")
+        key_font = ("TkFixedFont", 9)
+        action_font = ("TkDefaultFont", 9)
+
+        for section_title, rows in self._CONTROLS_SECTIONS:
+            # Small gap above each section after the first.
+            pady = (6, 1) if row > 0 else (0, 1)
+            ttk.Label(
+                parent, text=section_title, font=header_font,
+            ).grid(row=row, column=0, columnspan=2, sticky="w", pady=pady)
+            row += 1
+            for key, action in rows:
+                ttk.Label(parent, text=key, font=key_font).grid(
+                    row=row, column=0, sticky="w", padx=(10, 10)
+                )
+                ttk.Label(parent, text=action, font=action_font).grid(
+                    row=row, column=1, sticky="w"
+                )
+                row += 1
+
+        # Final hint that's easy to miss for users running the GUI the
+        # first time; placed under the last section with a separator feel.
+        ttk.Separator(parent, orient="horizontal").grid(
+            row=row, column=0, columnspan=2, sticky="ew", pady=(8, 4)
+        )
+        row += 1
+        ttk.Label(
+            parent,
+            text=(
+                "Click the video area to focus keyboard on the robot.\n"
+                "Arrow keys duplicate W/A/S/D for the base."
+            ),
+            font=("TkDefaultFont", 8),
+            foreground="#555",
+            justify="left",
+        ).grid(row=row, column=0, columnspan=2, sticky="w")
 
     # ----- events ---------------------------------------------------------
 
