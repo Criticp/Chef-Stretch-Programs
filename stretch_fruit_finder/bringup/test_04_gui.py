@@ -75,6 +75,8 @@ if str(_HERE) not in sys.path:
 from fruit_finder.camera import CameraManager  # noqa: E402
 from fruit_finder.detector import COCO_FOOD_NAMES, Detection, FoodDetector  # noqa: E402
 from fruit_finder.gamepad import GamepadState, GamepadThread  # noqa: E402
+import _arm_exec  # noqa: E402
+import _arm_keyboard_driver  # noqa: E402
 import _core  # noqa: E402
 import _gamepad_exec  # noqa: E402
 import _keyboard_driver  # noqa: E402
@@ -300,11 +302,19 @@ class FruitFinderGUI:
         # GamepadExecutor after the GUI is constructed.
         self.keyboard = _keyboard_driver.KeyboardDriver(self.root, config)
 
+        # Arm keyboard driver binds I/K/J/L/U/O/Y/H/N/M/[/] to
+        # arm / lift / wrist / gripper. ArmExecutor (started in main())
+        # consumes the driver state at 30 Hz.
+        self.arm_keyboard = _arm_keyboard_driver.ArmKeyboardDriver(
+            self.root, config
+        )
+
         self._build_layout()
         self._log(
             "GUI ready. Set a target and press Start search. "
-            "W/A/S/D (or arrows) drive the base; left gamepad stick also "
-            "works if a pad is connected."
+            "W/A/S/D (or arrows) drive the base; I/K/J/L drive lift+arm; "
+            "U/O = wrist yaw; Y/H = wrist pitch; N/M = wrist roll; "
+            "[ / ] = gripper close/open; X = stow arm."
         )
         self.root.after(self.update_interval_ms, self._poll_events)
         self.root.after(250, self._poll_slow)
@@ -382,10 +392,14 @@ class FruitFinderGUI:
             btn_frame, text="Stop", command=self._on_stop
         )
         self.stop_btn.grid(row=1, column=0, sticky="ew", pady=2)
+        self.stow_btn = ttk.Button(
+            btn_frame, text="Stow arm", command=self._on_stow_arm
+        )
+        self.stow_btn.grid(row=2, column=0, sticky="ew", pady=2)
         self.quit_btn = ttk.Button(
             btn_frame, text="Quit", command=self._on_close
         )
-        self.quit_btn.grid(row=2, column=0, sticky="ew", pady=2)
+        self.quit_btn.grid(row=3, column=0, sticky="ew", pady=2)
         btn_frame.columnconfigure(0, weight=1)
 
         status_frame = ttk.LabelFrame(right, text="Status", padding=6)
@@ -405,6 +419,10 @@ class FruitFinderGUI:
         self.gamepad_status_label.grid(row=5, column=0, sticky="w")
         self.keyboard_status_label = ttk.Label(status_frame, text="Keyboard: idle")
         self.keyboard_status_label.grid(row=6, column=0, sticky="w")
+        self.arm_status_label = ttk.Label(status_frame, text="Arm: idle")
+        self.arm_status_label.grid(row=7, column=0, sticky="w")
+        self.arm_pose_label = ttk.Label(status_frame, text="Lift/Arm: — / —")
+        self.arm_pose_label.grid(row=8, column=0, sticky="w")
 
     # ----- events ---------------------------------------------------------
 
@@ -434,6 +452,12 @@ class FruitFinderGUI:
         self.locked_status_label.configure(text="Locked: —")
         self.command_q.put(("start", detector_arg))
         self._log(f"Starting search for {display}")
+
+    def _on_stow_arm(self) -> None:
+        # The ArmKeyboardDriver's stow flag is edge-triggered; ArmExecutor
+        # will pick it up on its next tick (~33 ms).
+        self.arm_keyboard._stow_requested = True  # set directly for click UX
+        self._log("Stow arm requested")
 
     def _on_stop(self) -> None:
         self.command_q.put(("stop",))
@@ -484,11 +508,9 @@ class FruitFinderGUI:
                     text = "Gamepad: connected (idle)"
             self.gamepad_status_label.configure(text=text)
 
-        # Refresh the keyboard status line.
+        # Refresh the keyboard status line (base teleop).
         pressed = self.keyboard.pressed_snapshot()
         if pressed:
-            # Pretty-print by the alias the user probably knows (W rather than
-            # 'w', ^ for Up, etc.). Ordering is arbitrary — just a snapshot.
             pretty = {
                 "w": "W", "W": "W", "Up": "↑",
                 "s": "S", "S": "S", "Down": "↓",
@@ -501,6 +523,37 @@ class FruitFinderGUI:
             )
         else:
             self.keyboard_status_label.configure(text="Keyboard: idle")
+
+        # Refresh the arm keyboard status line (I/K/J/L/U/O/Y/H/N/M/[/]).
+        arm_pressed = self.arm_keyboard.pressed_snapshot()
+        if arm_pressed:
+            pretty = {
+                "i": "I", "I": "I", "k": "K", "K": "K",
+                "j": "J", "J": "J", "l": "L", "L": "L",
+                "u": "U", "U": "U", "o": "O", "O": "O",
+                "y": "Y", "Y": "Y", "h": "H", "H": "H",
+                "n": "N", "N": "N", "m": "M", "M": "M",
+                "bracketleft": "[", "bracketright": "]",
+            }
+            labels = sorted({pretty.get(k, k) for k in arm_pressed})
+            self.arm_status_label.configure(
+                text=f"Arm: {'+'.join(labels)}"
+            )
+        else:
+            self.arm_status_label.configure(text="Arm: idle")
+
+        # Live lift / arm positions, best-effort read under the lock.
+        if self.robot_lock is not None:
+            try:
+                with self.robot_lock:
+                    lift_pos = float(self.robot.lift.status.get("pos", 0.0))
+                    arm_pos = float(self.robot.arm.status.get("pos", 0.0))
+                self.arm_pose_label.configure(
+                    text=f"Lift/Arm: {lift_pos:+.2f} m / {arm_pos:+.2f} m"
+                )
+            except Exception:
+                # Don't spam the log if a read fails transiently.
+                pass
 
         self.root.after(250, self._poll_slow)
 
@@ -683,6 +736,7 @@ def main() -> int:
     gp_state = GamepadState()
     gp_thread: Optional[GamepadThread] = None
     gp_exec: Optional[_gamepad_exec.GamepadExecutor] = None
+    arm_exec: Optional[_arm_exec.ArmExecutor] = None
 
     try:
         started = robot.startup()
@@ -722,10 +776,20 @@ def main() -> int:
         )
         gp_exec.start()
 
+        # Arm executor consumes the arm-keyboard driver that lives inside
+        # the GUI. Needs the same shared robot_lock so its push_command
+        # doesn't race with the base's.
+        arm_exec = _arm_exec.ArmExecutor(
+            robot, app.arm_keyboard, robot_lock, config, shutdown_event
+        )
+        arm_exec.start()
+
         root.mainloop()
     finally:
         # Signal every thread to wind down, then join.
         shutdown_event.set()
+        if arm_exec is not None:
+            arm_exec.join(timeout=2.0)
         if gp_exec is not None:
             gp_exec.join(timeout=2.0)
         if gp_thread is not None:
