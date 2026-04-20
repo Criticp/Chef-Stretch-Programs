@@ -40,16 +40,17 @@ navigation:
   grid_resolution_m: 0.05          # Occupancy grid cell size
 
 tracking:
-  kp: 0.5                          # Proportional gain: fraction of radian error to correct per step
+  kp: 0.6                          # Proportional gain: fraction of radian error to correct per step
   target_conf_min: 0.25            # Min confidence to keep tracking (sweep uses sweep_acquire_conf_min)
   sweep_acquire_conf_min: 0.50     # Min confidence to EXIT sweep and start tracking
-  lost_frames_timeout: 30          # Consecutive no-target frames before giving up (now each frame is stable)
-  max_step_rad: 0.08               # Max pan/tilt correction per iteration (smaller = less motion blur)
+  lost_frames_timeout: 30          # Consecutive no-target frames before giving up
+  max_step_rad: 0.18               # Max pan/tilt correction per iteration (larger = snappier tracking)
   deadband_rad: 0.05               # If |error| < this, don't command a move on that axis (~3 degrees)
   pan_sign: -1                     # Starting guess; auto_sign_flip will correct it if wrong
   tilt_sign: -1                    # Same
   auto_sign_flip: true             # Probe on first move, flip sign automatically if error grew
-  stable_frames_drain: 3           # Drain this many frames each iteration to skip motion-blurred ones
+  stable_frames_drain: 2           # Drain this many frames each iteration to skip motion-blurred ones
+  wait_command_in_track: false     # If true, wait for each head move to finish before re-detecting (slow but ultra-stable)
   verbose_first_n: 10              # Per-iteration detailed logging for the first N track frames
 
 arm:
