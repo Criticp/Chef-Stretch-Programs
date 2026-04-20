@@ -30,11 +30,18 @@ from __future__ import annotations
 import logging
 import threading
 import time
-from typing import Optional
+from typing import Callable, Optional, Tuple
 
 from fruit_finder.gamepad import GamepadState
 
 logger = logging.getLogger(__name__)
+
+
+# Signature for the optional extra source. Called each tick to produce an
+# additional (v_trans_m_s, v_rot_rad_s) that gets summed with the gamepad
+# stick contribution before clamping. The KeyboardDriver's `.velocity()`
+# method satisfies this.
+VelocitySource = Callable[[], Tuple[float, float]]
 
 
 class GamepadExecutor(threading.Thread):
@@ -48,6 +55,7 @@ class GamepadExecutor(threading.Thread):
         config: dict,
         stop_event: threading.Event,
         rate_hz: float = 30.0,
+        extra_velocity_source: Optional[VelocitySource] = None,
     ):
         super().__init__(daemon=True, name="GamepadExecutor")
 
@@ -55,6 +63,7 @@ class GamepadExecutor(threading.Thread):
         self.state = gamepad_state
         self.robot_lock = robot_lock
         self.stop_event = stop_event
+        self.extra_velocity_source = extra_velocity_source
 
         gp_cfg = config.get("gamepad", {}) or {}
         self.max_trans_m_s = float(gp_cfg.get("base_translate_speed", 0.1))
@@ -89,8 +98,10 @@ class GamepadExecutor(threading.Thread):
 
     def run(self) -> None:
         logger.info(
-            "GamepadExecutor started: max_trans=%.2f m/s  max_rot=%.2f rad/s  rate=%.0fHz",
+            "GamepadExecutor started: max_trans=%.2f m/s  max_rot=%.2f rad/s  rate=%.0fHz  "
+            "extra_source=%s",
             self.max_trans_m_s, self.max_rot_rad_s, self.rate_hz,
+            "yes" if self.extra_velocity_source is not None else "no",
         )
 
         try:
@@ -104,27 +115,41 @@ class GamepadExecutor(threading.Thread):
                     self.stop_event.set()
                     break
 
-                # Only drive the base when the gamepad is connected; otherwise
-                # hold position so a disconnect doesn't leave us running.
-                if not snap.connected:
-                    if self._last_v != (0.0, 0.0):
-                        self._halt()
-                    time.sleep(self._period)
-                    continue
+                # Gamepad stick contribution. If not connected, treat as zero
+                # so the extra source (keyboard) can still drive the base.
+                if snap.connected:
+                    gp_trans = -snap.left_y * self.max_trans_m_s
+                    gp_rot = -snap.left_x * self.max_rot_rad_s
+                else:
+                    gp_trans = 0.0
+                    gp_rot = 0.0
 
-                # Stick -> velocity mapping.
-                # Pygame left_y is positive-DOWN, so negate for forward-positive.
-                # Pygame left_x is positive-RIGHT, so negate so stick-left = CCW.
-                v_trans = -snap.left_y * self.max_trans_m_s
-                v_rot = -snap.left_x * self.max_rot_rad_s
+                # Extra source (keyboard driver, etc.), if provided.
+                kb_trans = 0.0
+                kb_rot = 0.0
+                if self.extra_velocity_source is not None:
+                    try:
+                        kb_trans, kb_rot = self.extra_velocity_source()
+                    except Exception as exc:
+                        logger.warning("extra velocity source raised: %s", exc)
+                        kb_trans, kb_rot = 0.0, 0.0
+
+                # Combine: simple sum, then clamp to configured maxima. A
+                # gamepad stick pushed forward plus keyboard holding W will
+                # cap at max_trans_m_s, not double it. Opposing inputs
+                # cancel.
+                v_trans = gp_trans + kb_trans
+                v_rot = gp_rot + kb_rot
+                v_trans = max(-self.max_trans_m_s, min(self.max_trans_m_s, v_trans))
+                v_rot = max(-self.max_rot_rad_s, min(self.max_rot_rad_s, v_rot))
 
                 # Only hit the bus when the command meaningfully changed.
                 # Tiny changes get dropped to keep USB traffic low.
                 dv_trans = abs(v_trans - self._last_v[0])
                 dv_rot = abs(v_rot - self._last_v[1])
                 changed = dv_trans > 0.005 or dv_rot > 0.01
-                # Always force a zero-velocity push once after stick returns to
-                # center, so the base actually comes to a stop.
+                # Always force a zero-velocity push once after the command
+                # returns to center, so the base actually comes to a stop.
                 returning_to_zero = (
                     (v_trans == 0.0 and v_rot == 0.0)
                     and self._last_v != (0.0, 0.0)

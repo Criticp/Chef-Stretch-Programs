@@ -77,6 +77,7 @@ from fruit_finder.detector import COCO_FOOD_NAMES, Detection, FoodDetector  # no
 from fruit_finder.gamepad import GamepadState, GamepadThread  # noqa: E402
 import _core  # noqa: E402
 import _gamepad_exec  # noqa: E402
+import _keyboard_driver  # noqa: E402
 
 
 # Shown in the target dropdown to select any-food mode.
@@ -292,14 +293,19 @@ class FruitFinderGUI:
         self._last_tilt = 0.0
         self._closing = False  # guards _on_close from double-firing
 
+        # Keyboard driver binds WASD / arrow keys to a velocity state the
+        # GamepadExecutor reads alongside the gamepad stick. Always active
+        # — a plugged-in keyboard is the baseline input. Exposed as
+        # `self.keyboard` so main() can pass its velocity method to the
+        # GamepadExecutor after the GUI is constructed.
+        self.keyboard = _keyboard_driver.KeyboardDriver(self.root, config)
+
         self._build_layout()
-        gp_msg = (
+        self._log(
             "GUI ready. Set a target and press Start search. "
-            "Left stick drives the base."
-            if self.gp_state is not None
-            else "GUI ready. Set a target and press Start search."
+            "W/A/S/D (or arrows) drive the base; left gamepad stick also "
+            "works if a pad is connected."
         )
-        self._log(gp_msg)
         self.root.after(self.update_interval_ms, self._poll_events)
         self.root.after(250, self._poll_slow)
 
@@ -397,6 +403,8 @@ class FruitFinderGUI:
         gp_initial = "Gamepad: —" if self.gp_state is None else "Gamepad: searching..."
         self.gamepad_status_label = ttk.Label(status_frame, text=gp_initial)
         self.gamepad_status_label.grid(row=5, column=0, sticky="w")
+        self.keyboard_status_label = ttk.Label(status_frame, text="Keyboard: idle")
+        self.keyboard_status_label.grid(row=6, column=0, sticky="w")
 
     # ----- events ---------------------------------------------------------
 
@@ -475,6 +483,24 @@ class FruitFinderGUI:
                 else:
                     text = "Gamepad: connected (idle)"
             self.gamepad_status_label.configure(text=text)
+
+        # Refresh the keyboard status line.
+        pressed = self.keyboard.pressed_snapshot()
+        if pressed:
+            # Pretty-print by the alias the user probably knows (W rather than
+            # 'w', ^ for Up, etc.). Ordering is arbitrary — just a snapshot.
+            pretty = {
+                "w": "W", "W": "W", "Up": "↑",
+                "s": "S", "S": "S", "Down": "↓",
+                "a": "A", "A": "A", "Left": "←",
+                "d": "D", "D": "D", "Right": "→",
+            }
+            labels = sorted({pretty.get(k, k) for k in pressed})
+            self.keyboard_status_label.configure(
+                text=f"Keyboard: {'+'.join(labels)}"
+            )
+        else:
+            self.keyboard_status_label.configure(text="Keyboard: idle")
 
         self.root.after(250, self._poll_slow)
 
@@ -673,15 +699,15 @@ def main() -> int:
             cam.stop()
             return 1
 
-        # Start the gamepad reader + executor BEFORE the GUI so the left
-        # stick is already live by the time the user opens the app.
+        # Start the gamepad reader thread. It only READS input; it doesn't
+        # touch the robot on its own, so order relative to the executor
+        # doesn't matter.
         gp_thread = GamepadThread(config, gp_state)
         gp_thread.start()
-        gp_exec = _gamepad_exec.GamepadExecutor(
-            robot, gp_state, robot_lock, config, shutdown_event
-        )
-        gp_exec.start()
 
+        # Build the GUI before starting the GamepadExecutor, because the
+        # executor needs to pull keyboard velocity from the KeyboardDriver
+        # that lives inside the GUI.
         root = tk.Tk()
         app = FruitFinderGUI(
             root, config, robot, cam, detector,
@@ -689,6 +715,13 @@ def main() -> int:
             gp_state=gp_state,
             shutdown_event=shutdown_event,
         )
+
+        gp_exec = _gamepad_exec.GamepadExecutor(
+            robot, gp_state, robot_lock, config, shutdown_event,
+            extra_velocity_source=app.keyboard.velocity,
+        )
+        gp_exec.start()
+
         root.mainloop()
     finally:
         # Signal every thread to wind down, then join.
