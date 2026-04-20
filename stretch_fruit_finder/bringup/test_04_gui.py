@@ -44,6 +44,7 @@ Exit cleanly by closing the window or pressing the Stop button then Quit.
 from __future__ import annotations
 
 import logging
+import os
 import queue
 import sys
 import threading
@@ -51,6 +52,13 @@ import time
 import tkinter as tk
 from pathlib import Path
 from tkinter import ttk
+from typing import Optional
+
+# pygame (used by the gamepad reader) wants a display by default. Set the
+# dummy driver before any pygame import so the GUI works over SSH without
+# X-forwarding. If $DISPLAY is already set for the local HDMI session we
+# leave it alone.
+os.environ.setdefault("SDL_VIDEODRIVER", "dummy")
 
 import cv2
 import numpy as np
@@ -66,7 +74,9 @@ if str(_HERE) not in sys.path:
 
 from fruit_finder.camera import CameraManager  # noqa: E402
 from fruit_finder.detector import COCO_FOOD_NAMES, Detection, FoodDetector  # noqa: E402
+from fruit_finder.gamepad import GamepadState, GamepadThread  # noqa: E402
 import _core  # noqa: E402
+import _gamepad_exec  # noqa: E402
 
 
 # Shown in the target dropdown to select any-food mode.
@@ -97,6 +107,7 @@ class Worker(threading.Thread):
         command_q: queue.Queue,
         event_q: queue.Queue,
         shutdown_event: threading.Event,
+        robot_lock: Optional[threading.Lock] = None,
     ):
         super().__init__(daemon=True, name="FruitFinderWorker")
         self.robot = robot
@@ -106,6 +117,7 @@ class Worker(threading.Thread):
         self.command_q = command_q
         self.event_q = event_q
         self.shutdown_event = shutdown_event
+        self.robot_lock = robot_lock
         self._stop_current = threading.Event()  # stops the current sweep/track loop
 
     def stop_current(self) -> None:
@@ -178,23 +190,24 @@ class Worker(threading.Thread):
                         target_label,
                         self._stop_current,
                         on_pose=self._make_on_pose(),
+                        robot_lock=self.robot_lock,
                     )
                 except Exception as exc:
                     self.event_q.put(("log", f"ERROR during sweep: {exc}"))
                     self._publish_state("IDLE")
-                    _core.center_head(self.robot)
+                    _core.center_head(self.robot, robot_lock=self.robot_lock)
                     continue
 
                 if self._stop_current.is_set():
                     self.event_q.put(("log", "Search stopped by user"))
                     self._publish_state("IDLE")
-                    _core.center_head(self.robot)
+                    _core.center_head(self.robot, robot_lock=self.robot_lock)
                     continue
 
                 if result is None:
                     self.event_q.put(("log", f"Target {target_label!r} not found"))
                     self._publish_state("IDLE")
-                    _core.center_head(self.robot)
+                    _core.center_head(self.robot, robot_lock=self.robot_lock)
                     continue
 
                 target_det, acq_pan, acq_tilt = result
@@ -213,6 +226,7 @@ class Worker(threading.Thread):
                         self.config,
                         self._stop_current,
                         on_pose=self._make_on_pose(),
+                        robot_lock=self.robot_lock,
                     )
                 except Exception as exc:
                     self.event_q.put(("log", f"ERROR during track: {exc}"))
@@ -220,7 +234,7 @@ class Worker(threading.Thread):
 
                 self.event_q.put(("log", f"Track ended: {reason}"))
                 self._publish_state("IDLE")
-                _core.center_head(self.robot)
+                _core.center_head(self.robot, robot_lock=self.robot_lock)
 
 
 # ----- GUI ----------------------------------------------------------------
@@ -234,12 +248,17 @@ class FruitFinderGUI:
         robot,
         cam: CameraManager,
         detector: FoodDetector,
+        robot_lock: Optional[threading.Lock] = None,
+        gp_state: Optional[GamepadState] = None,
+        shutdown_event: Optional[threading.Event] = None,
     ):
         self.root = root
         self.config = config
         self.robot = robot
         self.cam = cam
         self.detector = detector
+        self.robot_lock = robot_lock
+        self.gp_state = gp_state
 
         gui_cfg = config.get("gui", {}) or {}
         self.update_interval_ms = int(gui_cfg.get("update_interval_ms", 33))
@@ -252,12 +271,15 @@ class FruitFinderGUI:
         # Queues for worker communication.
         self.command_q: queue.Queue = queue.Queue()
         self.event_q: queue.Queue = queue.Queue(maxsize=8)
-        self.shutdown_event = threading.Event()
+        # Either accept a shutdown_event from main() (so gamepad exec and
+        # other threads outside the GUI share it) or create a fresh one.
+        self.shutdown_event = shutdown_event or threading.Event()
 
         # Worker thread.
         self.worker = Worker(
             robot, cam, detector, config,
             self.command_q, self.event_q, self.shutdown_event,
+            robot_lock=self.robot_lock,
         )
         self.worker.start()
 
@@ -268,10 +290,18 @@ class FruitFinderGUI:
         self._current_photo = None  # keep reference or tkinter garbage-collects
         self._last_pan = 0.0
         self._last_tilt = 0.0
+        self._closing = False  # guards _on_close from double-firing
 
         self._build_layout()
-        self._log("GUI ready. Set a target and press Start search.")
+        gp_msg = (
+            "GUI ready. Set a target and press Start search. "
+            "Left stick drives the base."
+            if self.gp_state is not None
+            else "GUI ready. Set a target and press Start search."
+        )
+        self._log(gp_msg)
         self.root.after(self.update_interval_ms, self._poll_events)
+        self.root.after(250, self._poll_slow)
 
     def _build_layout(self) -> None:
         main = ttk.Frame(self.root, padding=8)
@@ -364,6 +394,9 @@ class FruitFinderGUI:
         self.target_status_label.grid(row=3, column=0, sticky="w")
         self.locked_status_label = ttk.Label(status_frame, text="Locked: —")
         self.locked_status_label.grid(row=4, column=0, sticky="w")
+        gp_initial = "Gamepad: —" if self.gp_state is None else "Gamepad: searching..."
+        self.gamepad_status_label = ttk.Label(status_frame, text=gp_initial)
+        self.gamepad_status_label.grid(row=5, column=0, sticky="w")
 
     # ----- events ---------------------------------------------------------
 
@@ -400,6 +433,11 @@ class FruitFinderGUI:
         self._log("Stop requested")
 
     def _on_close(self) -> None:
+        # Idempotent — both the Quit button and the gamepad Back button
+        # route through here via shutdown_event, so guard against re-entry.
+        if self._closing:
+            return
+        self._closing = True
         self._log("Shutting down...")
         self.shutdown_event.set()
         self.worker.stop_current()
@@ -407,6 +445,38 @@ class FruitFinderGUI:
             self.root.after(150, self.root.destroy)
         except Exception:
             self.root.destroy()
+
+    def _poll_slow(self) -> None:
+        """
+        Slow tick (~4 Hz): updates the gamepad-status line and closes the
+        GUI if something else (Ctrl+C, gamepad Back button, GamepadExecutor
+        error) has already set shutdown_event.
+        """
+        if self._closing:
+            return
+
+        # External shutdown trigger — e.g. gamepad Back button was pressed.
+        if self.shutdown_event.is_set():
+            self._on_close()
+            return
+
+        # Refresh the gamepad status line.
+        if self.gp_state is not None:
+            snap = self.gp_state.get_copy()
+            if not snap.connected:
+                text = "Gamepad: not connected"
+            else:
+                driving = abs(snap.left_x) > 0.01 or abs(snap.left_y) > 0.01
+                if driving:
+                    text = (
+                        f"Gamepad: driving "
+                        f"(stick x={snap.left_x:+.2f}, y={snap.left_y:+.2f})"
+                    )
+                else:
+                    text = "Gamepad: connected (idle)"
+            self.gamepad_status_label.configure(text=text)
+
+        self.root.after(250, self._poll_slow)
 
     # ----- queue poll -----------------------------------------------------
 
@@ -577,6 +647,17 @@ def main() -> int:
 
     robot = sb_robot.Robot()
     started = False
+
+    # Shared between GUI worker, gamepad reader, gamepad executor.
+    # Any thread that touches the robot object acquires robot_lock first;
+    # shutdown_event is the global "stop everything and clean up" signal.
+    robot_lock = threading.Lock()
+    shutdown_event = threading.Event()
+
+    gp_state = GamepadState()
+    gp_thread: Optional[GamepadThread] = None
+    gp_exec: Optional[_gamepad_exec.GamepadExecutor] = None
+
     try:
         started = robot.startup()
         if not started:
@@ -592,12 +673,42 @@ def main() -> int:
             cam.stop()
             return 1
 
+        # Start the gamepad reader + executor BEFORE the GUI so the left
+        # stick is already live by the time the user opens the app.
+        gp_thread = GamepadThread(config, gp_state)
+        gp_thread.start()
+        gp_exec = _gamepad_exec.GamepadExecutor(
+            robot, gp_state, robot_lock, config, shutdown_event
+        )
+        gp_exec.start()
+
         root = tk.Tk()
-        app = FruitFinderGUI(root, config, robot, cam, detector)
+        app = FruitFinderGUI(
+            root, config, robot, cam, detector,
+            robot_lock=robot_lock,
+            gp_state=gp_state,
+            shutdown_event=shutdown_event,
+        )
         root.mainloop()
     finally:
+        # Signal every thread to wind down, then join.
+        shutdown_event.set()
+        if gp_exec is not None:
+            gp_exec.join(timeout=2.0)
+        if gp_thread is not None:
+            gp_thread.stop()
+            gp_thread.join(timeout=2.0)
+
         if started:
-            _core.center_head(robot)
+            # In case the gamepad executor didn't get a chance to stop the
+            # base, zero it explicitly before we let go of the robot.
+            try:
+                with robot_lock:
+                    robot.base.set_velocity(0.0, 0.0)
+                    robot.push_command()
+            except Exception:
+                pass
+            _core.center_head(robot, robot_lock=robot_lock)
             try:
                 robot.stop()
             except Exception:
