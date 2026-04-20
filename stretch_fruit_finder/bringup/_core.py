@@ -16,11 +16,12 @@ error is converted to radian error using the RealSense intrinsics
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import threading
 import time
 from dataclasses import dataclass
-from typing import Callable, Optional
+from typing import Callable, ContextManager, Optional
 
 import numpy as np
 
@@ -28,6 +29,16 @@ from fruit_finder.camera import CameraManager
 from fruit_finder.detector import Detection, FoodDetector
 
 logger = logging.getLogger(__name__)
+
+
+def _lock_ctx(lock: Optional[threading.Lock]) -> ContextManager:
+    """Return `lock` itself when provided, or a no-op context otherwise.
+
+    Lets the sweep/track loops be written once and work either standalone
+    (no lock needed) or alongside another thread that also touches the
+    robot (lock required to serialise `push_command()` etc).
+    """
+    return lock if lock is not None else contextlib.nullcontext()
 
 
 # ----- type aliases --------------------------------------------------------
@@ -157,13 +168,18 @@ def pick_target(detections: list[Detection], conf_min: float) -> Optional[Detect
     return max(hits, key=lambda d: d.confidence)
 
 
-def center_head(robot, wait: bool = True) -> None:
+def center_head(
+    robot,
+    wait: bool = True,
+    robot_lock: Optional[threading.Lock] = None,
+) -> None:
     """Best-effort: return head to (pan=0, tilt=0)."""
     try:
-        robot.head.move_to("head_pan", 0.0)
-        robot.head.move_to("head_tilt", 0.0)
-        if wait:
-            robot.wait_command()
+        with _lock_ctx(robot_lock):
+            robot.head.move_to("head_pan", 0.0)
+            robot.head.move_to("head_tilt", 0.0)
+            if wait:
+                robot.wait_command()
     except Exception as exc:
         logger.warning("center_head failed: %s", exc)
 
@@ -180,6 +196,7 @@ def sweep_until_target(
     stop_event: threading.Event,
     on_pose: PoseCallback = None,
     warmup_frames: int = 6,
+    robot_lock: Optional[threading.Lock] = None,
 ) -> Optional[tuple[Detection, float, float]]:
     """
     Pan the head through the configured search range, running the detector
@@ -210,9 +227,10 @@ def sweep_until_target(
     )
 
     # Move to search tilt + center pan before the sweep.
-    robot.head.move_to("head_pan", 0.0)
-    robot.head.move_to("head_tilt", tilt_target)
-    robot.wait_command()
+    with _lock_ctx(robot_lock):
+        robot.head.move_to("head_pan", 0.0)
+        robot.head.move_to("head_tilt", tilt_target)
+        robot.wait_command()
     time.sleep(0.2)
     drain_frames(cam, warmup_frames)
 
@@ -233,15 +251,17 @@ def sweep_until_target(
                 return None
             pan = clamp(pan, limits.pan_lo, limits.pan_hi)
 
-            robot.head.move_to("head_pan", pan)
-            robot.wait_command()
+            with _lock_ctx(robot_lock):
+                robot.head.move_to("head_pan", pan)
+                robot.wait_command()
             time.sleep(dwell)
 
             color, _depth = drain_frames(cam, warmup_frames)
             if color is None:
                 continue
 
-            real_pan, real_tilt = read_head_pose(robot)
+            with _lock_ctx(robot_lock):
+                real_pan, real_tilt = read_head_pose(robot)
             detections = detector.detect(color)
 
             if on_pose is not None:
@@ -277,6 +297,7 @@ def track(
     stop_event: threading.Event,
     on_pose: PoseCallback = None,
     params: Optional[TrackerParams] = None,
+    robot_lock: Optional[threading.Lock] = None,
 ) -> str:
     """
     Closed-loop P controller: keep the highest-confidence target centered.
@@ -328,7 +349,8 @@ def track(
             continue
 
         detections = detector.detect(color)
-        real_pan, real_tilt = read_head_pose(robot)
+        with _lock_ctx(robot_lock):
+            real_pan, real_tilt = read_head_pose(robot)
 
         if on_pose is not None:
             try:
@@ -436,20 +458,21 @@ def track(
             probe_err_before = (err_x_rad, err_y_rad)
             probe_delta = (delta_pan, delta_tilt)
 
-        # --- command the move and wait for it to finish ---
+        # --- command the move and optionally wait for it to finish ---
         moved_any = False
-        if abs(new_pan - real_pan) > 1e-3:
-            robot.head.move_to("head_pan", new_pan)
-            moved_any = True
-        if abs(new_tilt - real_tilt) > 1e-3:
-            robot.head.move_to("head_tilt", new_tilt)
-            moved_any = True
+        with _lock_ctx(robot_lock):
+            if abs(new_pan - real_pan) > 1e-3:
+                robot.head.move_to("head_pan", new_pan)
+                moved_any = True
+            if abs(new_tilt - real_tilt) > 1e-3:
+                robot.head.move_to("head_tilt", new_tilt)
+                moved_any = True
 
-        if moved_any and tp.wait_command_in_track:
-            try:
-                robot.wait_command()
-            except Exception as exc:
-                logger.warning("wait_command failed: %s", exc)
+            if moved_any and tp.wait_command_in_track:
+                try:
+                    robot.wait_command()
+                except Exception as exc:
+                    logger.warning("wait_command failed: %s", exc)
 
         iteration += 1
 
