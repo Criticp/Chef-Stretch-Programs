@@ -72,10 +72,14 @@ arm:
   max_extension_m: 0.5             # Maximum arm extension
   min_lift_m: 0.05                 # Minimum lift height
   max_lift_m: 1.05                 # Maximum lift height
-  stow_lift_m: 0.8                 # Lift height when stowed
-  stow_arm_m: 0.0                  # Arm extension when stowed
+  # Stow doubles as the "ready for hover" default pose. Lift sits at a
+  # known mid-height and the wrist is horizontal so the gripper points
+  # outward along the arm extension axis — that's the orientation the
+  # Hover routine expects when it starts its lateral scan.
+  stow_lift_m: 0.6                 # Lift height when stowed (hover-ready default)
+  stow_arm_m: 0.0                  # Arm extension when stowed (fully retracted)
   stow_wrist_yaw: 0.0
-  stow_wrist_pitch: -0.5
+  stow_wrist_pitch: 0.0            # Horizontal — gripper points outward along the arm
   stow_wrist_roll: 0.0
   search_lift_m: 0.8               # Lift height during search
   reach_wrist_pitch: -1.57         # Wrist pitch when reaching (point down)
