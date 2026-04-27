@@ -1078,6 +1078,7 @@ def hover_above_target(
     arm_controller,
     on_pose: PoseCallback = None,
     robot_lock: Optional[threading.Lock] = None,
+    wrist_yaw_target: float = 0.0,
 ) -> str:
     """Visual-servo hover: extend until the fruit is revealed past the
     gripper, then retract until it is occluded again.
@@ -1190,7 +1191,7 @@ def hover_above_target(
         lift_target_unreachable = float(cmd_by_joint.get("lift", stow_lift))
         with _lock_ctx(robot_lock):
             _safe_call("wrist_yaw",
-                       lambda: robot.end_of_arm.move_to("wrist_yaw", 0.0, wrist_v, wrist_a))
+                       lambda: robot.end_of_arm.move_to("wrist_yaw", wrist_yaw_target, wrist_v, wrist_a))
             _safe_call("wrist_pitch",
                        lambda: robot.end_of_arm.move_to("wrist_pitch", 0.0, wrist_v, wrist_a))
             _safe_call("wrist_roll",
@@ -1210,12 +1211,13 @@ def hover_above_target(
     # Right-side: full visual-servo path. Lift first to find the right
     # height, then arm extension to find the right lateral position.
 
-    # 1. Pose wrist outward + apply slightly-closed gripper.
+    # 1. Pose wrist (yaw honors the GUI Gripper-orientation toggle) + apply
+    #    slightly-closed gripper.
     if stop_event.is_set():
         return "stopped"
     with _lock_ctx(robot_lock):
         _safe_call("wrist_yaw",
-                   lambda: robot.end_of_arm.move_to("wrist_yaw", 0.0, wrist_v, wrist_a))
+                   lambda: robot.end_of_arm.move_to("wrist_yaw", wrist_yaw_target, wrist_v, wrist_a))
         _safe_call("wrist_pitch",
                    lambda: robot.end_of_arm.move_to("wrist_pitch", 0.0, wrist_v, wrist_a))
         _safe_call("wrist_roll",

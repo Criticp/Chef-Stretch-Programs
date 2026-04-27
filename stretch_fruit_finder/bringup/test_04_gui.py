@@ -111,6 +111,7 @@ class Worker(threading.Thread):
         command_q: queue.Queue,
         event_q: queue.Queue,
         shutdown_event: threading.Event,
+        arm_keyboard,
         robot_lock: Optional[threading.Lock] = None,
     ):
         super().__init__(daemon=True, name="FruitFinderWorker")
@@ -122,6 +123,10 @@ class Worker(threading.Thread):
         self.event_q = event_q
         self.shutdown_event = shutdown_event
         self.robot_lock = robot_lock
+        # Reference to the arm keyboard driver — we use it to (a) run
+        # apply_stow before each hover, and (b) read the user's persistent
+        # wrist-yaw preference (Gripper inward / outward toggle).
+        self.arm_keyboard = arm_keyboard
         self._stop_current = threading.Event()  # stops the current sweep/track loop
         # Set by request_hover() so the start-block doesn't re-centre the
         # head between exiting track() and the queued ("hover",) command.
@@ -260,11 +265,42 @@ class Worker(threading.Thread):
                 else:
                     _core.center_head(self.robot, robot_lock=self.robot_lock)
 
+            if cmd[0] == "set_wrist_yaw":
+                yaw = float(cmd[1])
+                arm_kbd_p = self.arm_keyboard._p  # already-validated tunables
+                wrist_v = float(arm_kbd_p.get("wrist_v_rad_s", 2.0))
+                wrist_a = float(arm_kbd_p.get("wrist_a_rad_s2", 4.0))
+                try:
+                    with _core._lock_ctx(self.robot_lock):
+                        self.robot.end_of_arm.move_to("wrist_yaw", yaw, wrist_v, wrist_a)
+                except Exception as exc:
+                    self.event_q.put(("log", f"set_wrist_yaw failed: {exc}"))
+                else:
+                    self.event_q.put((
+                        "log",
+                        f"Wrist yaw -> {yaw:+.2f} rad ({'inward' if abs(yaw) > 1.0 else 'outward'})",
+                    ))
+                continue
+
             if cmd[0] == "hover":
                 # The track loop has already exited (request_hover set
                 # _stop_current); clear it so this branch's own loops
                 # can run.
                 self._stop_current.clear()
+
+                # Stow first so every hover begins from a known starting
+                # pose (arm retracted, lift at stow_lift, wrist honoring
+                # the Gripper-orientation toggle, gripper fully closed).
+                self._publish_state("STOWING")
+                try:
+                    self.arm_keyboard.apply_stow(
+                        self.robot, self.robot_lock, self.config,
+                    )
+                except Exception as exc:
+                    self.event_q.put(("log", f"ERROR during pre-hover stow: {exc}"))
+                    self._publish_state("IDLE")
+                    continue
+
                 self._publish_state("HOVERING")
 
                 try:
@@ -274,6 +310,7 @@ class Worker(threading.Thread):
                         arm_controller=self.arm_controller,
                         on_pose=self._make_on_pose(),
                         robot_lock=self.robot_lock,
+                        wrist_yaw_target=self.arm_keyboard.get_wrist_yaw_target(),
                     )
                 except Exception as exc:
                     self.event_q.put(("log", f"ERROR during hover: {exc}"))
@@ -360,9 +397,26 @@ class FruitFinderGUI:
         self.shutdown_event = shutdown_event or threading.Event()
 
         # Worker thread.
+        # Keyboard driver binds WASD / arrow keys to a velocity state the
+        # GamepadExecutor reads alongside the gamepad stick. Always active
+        # — a plugged-in keyboard is the baseline input. Exposed as
+        # `self.keyboard` so main() can pass its velocity method to the
+        # GamepadExecutor after the GUI is constructed.
+        self.keyboard = _keyboard_driver.KeyboardDriver(self.root, config)
+
+        # Arm keyboard driver binds I/K/J/L/U/O/Y/H/N/M/[/] to
+        # arm / lift / wrist / gripper. ArmExecutor (started in main())
+        # consumes the driver state at 30 Hz. Constructed BEFORE the
+        # Worker because the Worker calls apply_stow() before each hover
+        # and reads the wrist-yaw toggle off the same driver.
+        self.arm_keyboard = _arm_keyboard_driver.ArmKeyboardDriver(
+            self.root, config
+        )
+
         self.worker = Worker(
             robot, cam, detector, config,
             self.command_q, self.event_q, self.shutdown_event,
+            arm_keyboard=self.arm_keyboard,
             robot_lock=self.robot_lock,
         )
         self.worker.start()
@@ -375,20 +429,6 @@ class FruitFinderGUI:
         self._last_pan = 0.0
         self._last_tilt = 0.0
         self._closing = False  # guards _on_close from double-firing
-
-        # Keyboard driver binds WASD / arrow keys to a velocity state the
-        # GamepadExecutor reads alongside the gamepad stick. Always active
-        # — a plugged-in keyboard is the baseline input. Exposed as
-        # `self.keyboard` so main() can pass its velocity method to the
-        # GamepadExecutor after the GUI is constructed.
-        self.keyboard = _keyboard_driver.KeyboardDriver(self.root, config)
-
-        # Arm keyboard driver binds I/K/J/L/U/O/Y/H/N/M/[/] to
-        # arm / lift / wrist / gripper. ArmExecutor (started in main())
-        # consumes the driver state at 30 Hz.
-        self.arm_keyboard = _arm_keyboard_driver.ArmKeyboardDriver(
-            self.root, config
-        )
 
         self._build_layout()
         self._log(
@@ -484,10 +524,22 @@ class FruitFinderGUI:
             btn_frame, text="Stow arm", command=self._on_stow_arm
         )
         self.stow_btn.grid(row=3, column=0, sticky="ew", pady=2)
+        # Persistent gripper-orientation toggle. Unchecked = wrist yaw 0
+        # (gripper points outward along the arm extension axis); checked =
+        # yaw rotated 180 deg so the gripper points back toward the robot.
+        # On click the wrist moves immediately, AND the new value is
+        # remembered so future Stow / Hover operations honor it.
+        self.gripper_inward_var = tk.BooleanVar(value=False)
+        self.gripper_inward_chk = ttk.Checkbutton(
+            btn_frame, text="Gripper points inward",
+            variable=self.gripper_inward_var,
+            command=self._on_gripper_orientation_toggle,
+        )
+        self.gripper_inward_chk.grid(row=4, column=0, sticky="ew", pady=2)
         self.quit_btn = ttk.Button(
             btn_frame, text="Quit", command=self._on_close
         )
-        self.quit_btn.grid(row=4, column=0, sticky="ew", pady=2)
+        self.quit_btn.grid(row=5, column=0, sticky="ew", pady=2)
         btn_frame.columnconfigure(0, weight=1)
 
         status_frame = ttk.LabelFrame(right, text="Status", padding=6)
@@ -639,6 +691,18 @@ class FruitFinderGUI:
         # and never drain the queue.
         self.worker.request_hover()
         self._log("Hover above target requested")
+
+    def _on_gripper_orientation_toggle(self) -> None:
+        # 0 rad = outward (along arm extension axis); pi rad = inward
+        # (rotated 180 deg so the gripper points back at the robot).
+        inward = bool(self.gripper_inward_var.get())
+        yaw_rad = float(np.pi) if inward else 0.0
+        # Persist the preference on the driver so any future Stow / Hover
+        # uses it without needing the GUI in the loop.
+        self.arm_keyboard.set_wrist_yaw_target(yaw_rad)
+        # Tell the Worker to apply the new yaw to the live wrist now.
+        self.command_q.put(("set_wrist_yaw", yaw_rad))
+        self._log(f"Gripper orientation: {'inward' if inward else 'outward'} (yaw -> {yaw_rad:+.2f} rad)")
 
     def _on_stop(self) -> None:
         self.command_q.put(("stop",))
