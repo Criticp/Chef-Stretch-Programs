@@ -92,7 +92,7 @@ arm:
   # occlude the fruit. Independent of the hardware max_lift_m so the
   # operator can constrain Hover without losing the joint's full range
   # for keyboard teleop or future routines.
-  hover_max_lift_m: 0.89
+  hover_max_lift_m: 0.92
   search_lift_m: 0.8               # Lift height during search
   reach_wrist_pitch: -1.57         # Wrist pitch when reaching (point down)
 
