@@ -71,6 +71,8 @@ class TrackerParams:
     reacquire_extent_rad: float = 0.6
     reacquire_budget_s: float = 2.0
     dt_predict_s: float = 0.5
+    reacquire_speed_rad_per_s: float = 0.3
+    reacquire_accel_rad_per_s2: float = 0.8
 
     @classmethod
     def from_config(cls, config: dict) -> "TrackerParams":
@@ -106,6 +108,12 @@ class TrackerParams:
                 trk.get("reacquire_budget_s", defaults.reacquire_budget_s)
             ),
             dt_predict_s=float(trk.get("dt_predict_s", defaults.dt_predict_s)),
+            reacquire_speed_rad_per_s=float(
+                trk.get("reacquire_speed_rad_per_s", defaults.reacquire_speed_rad_per_s)
+            ),
+            reacquire_accel_rad_per_s2=float(
+                trk.get("reacquire_accel_rad_per_s2", defaults.reacquire_accel_rad_per_s2)
+            ),
         )
 
 
@@ -277,6 +285,24 @@ def _resolve_tilt_rows(nav: dict, limits: HeadLimits) -> list[float]:
     return seen or [clamp(-0.6, limits.tilt_lo, limits.tilt_hi)]
 
 
+def _move_head_joint(robot, joint: str, x_des: float, v_des: Optional[float], a_des: Optional[float]) -> None:
+    """robot.head.move_to() with a velocity/accel cap, falling back if the SDK rejects the kwargs.
+
+    Stretch's head Dynamixels move at the joint's default profile velocity
+    (~3 rad/s for head_pan) when no v_des is given — way too fast for the
+    detector to find anything in flight. Pass v_des to actually slow it
+    down. If a particular SDK build doesn't accept the kwargs, fall back
+    to the plain call so we don't break older firmware.
+    """
+    try:
+        if v_des is not None or a_des is not None:
+            robot.head.move_to(joint, x_des, v_des=v_des, a_des=a_des)
+            return
+    except TypeError:
+        pass
+    robot.head.move_to(joint, x_des)
+
+
 def _slew_and_detect(
     robot,
     cam: CameraManager,
@@ -285,6 +311,7 @@ def _slew_and_detect(
     pan_target: float,
     conf_min: float,
     slew_speed_rad_per_s: float,
+    slew_accel_rad_per_s2: float,
     pan_arrival_tol_rad: float,
     time_budget_s: float,
     stop_event: threading.Event,
@@ -299,14 +326,18 @@ def _slew_and_detect(
     Returns (detection, pan, tilt) on first hit at/above `conf_min`, or None
     if the slew completes / stop_event fires / the time budget runs out.
 
-    On a hit, both pan and (if commanded) tilt are commanded back to the
-    live pose to halt the in-flight slew in place.
+    `slew_speed_rad_per_s` is passed to the joint as v_des so the head
+    actually moves at that speed instead of the (much faster) default
+    profile velocity. On a hit, both pan and (if commanded) tilt are
+    commanded back to the live pose to halt the in-flight slew in place.
     """
     with _lock_ctx(robot_lock):
         start_pan, start_tilt = read_head_pose(robot)
-        robot.head.move_to("head_pan", pan_target)
+        _move_head_joint(robot, "head_pan", pan_target,
+                         v_des=slew_speed_rad_per_s, a_des=slew_accel_rad_per_s2)
         if tilt_target is not None:
-            robot.head.move_to("head_tilt", tilt_target)
+            _move_head_joint(robot, "head_tilt", tilt_target,
+                             v_des=slew_speed_rad_per_s, a_des=slew_accel_rad_per_s2)
 
     pan_distance = abs(pan_target - start_pan)
     tilt_distance = abs((tilt_target or start_tilt) - start_tilt)
@@ -336,6 +367,8 @@ def _slew_and_detect(
 
         target = pick_target(detections, conf_min)
         if target is not None:
+            # Halt motion in place. Use the default (fast) profile here so
+            # the joint stops promptly rather than coasting at slew speed.
             with _lock_ctx(robot_lock):
                 robot.head.move_to("head_pan", real_pan)
                 if tilt_target is not None:
@@ -387,26 +420,24 @@ def reacquire_directional(
     speed = float(np.hypot(vp, vt))
     extent = max(0.1, tp.reacquire_extent_rad)
     moving = speed > 0.05  # rad/s — anything less is treated as "stationary"
+    slew_speed = tp.reacquire_speed_rad_per_s
+    slew_accel = tp.reacquire_accel_rad_per_s2
 
     if moving:
         # Predict where the target is "now" (dt_predict ahead of last sample),
-        # then extend along the same direction up to the full extent.
+        # then extend further along the same direction up to the full extent.
         dt = max(0.0, tp.dt_predict_s)
         pred_pan = last_abs_pan + vp * dt
         pred_tilt = last_abs_tilt + vt * dt
-        # Direction unit vector in (pan, tilt) space.
         ux = vp / speed
         uy = vt / speed
         end_pan = clamp(pred_pan + ux * extent, limits.pan_lo, limits.pan_hi)
         end_tilt = clamp(pred_tilt + uy * extent, limits.tilt_lo, limits.tilt_hi)
 
         logger.info(
-            "reacquire(directional): vel=(%+.2f, %+.2f) rad/s last=(%+.2f, %+.2f) -> end=(%+.2f, %+.2f)",
-            vp, vt, last_abs_pan, last_abs_tilt, end_pan, end_tilt,
+            "reacquire(directional): vel=(%+.2f, %+.2f) rad/s last=(%+.2f, %+.2f) -> end=(%+.2f, %+.2f) speed=%.2f",
+            vp, vt, last_abs_pan, last_abs_tilt, end_pan, end_tilt, slew_speed,
         )
-
-        # Take a moderate slew speed so we can both move and detect.
-        slew_speed = max(0.4, min(1.2, speed * 1.5 + 0.3))
 
         return _slew_and_detect(
             robot, cam, detector,
@@ -414,6 +445,7 @@ def reacquire_directional(
             tilt_target=end_tilt,
             conf_min=tp.target_conf_min,
             slew_speed_rad_per_s=slew_speed,
+            slew_accel_rad_per_s2=slew_accel,
             pan_arrival_tol_rad=0.05,
             time_budget_s=tp.reacquire_budget_s,
             stop_event=stop_event,
@@ -428,20 +460,19 @@ def reacquire_directional(
     tilt_hold = clamp(last_abs_tilt, limits.tilt_lo, limits.tilt_hi)
 
     logger.info(
-        "reacquire(scan): no velocity, scanning pan [%+.2f, %+.2f] at tilt %+.2f",
-        left, right, tilt_hold,
+        "reacquire(scan): no velocity, scanning pan [%+.2f, %+.2f] at tilt %+.2f speed=%.2f",
+        left, right, tilt_hold, slew_speed,
     )
 
     half_budget = max(0.5, tp.reacquire_budget_s * 0.5)
-    slew_speed = 0.5
 
-    # Sweep left, then right of the last-known position.
     hit = _slew_and_detect(
         robot, cam, detector,
         pan_target=left,
         tilt_target=tilt_hold,
         conf_min=tp.target_conf_min,
         slew_speed_rad_per_s=slew_speed,
+        slew_accel_rad_per_s2=slew_accel,
         pan_arrival_tol_rad=0.05,
         time_budget_s=half_budget,
         stop_event=stop_event,
@@ -457,6 +488,7 @@ def reacquire_directional(
         tilt_target=tilt_hold,
         conf_min=tp.target_conf_min,
         slew_speed_rad_per_s=slew_speed,
+        slew_accel_rad_per_s2=slew_accel,
         pan_arrival_tol_rad=0.05,
         time_budget_s=half_budget,
         stop_event=stop_event,
@@ -501,7 +533,8 @@ def sweep_until_target(
     pan_min = clamp(float(nav["search_pan_min_rad"]), limits.pan_lo, limits.pan_hi)
     pan_max = clamp(float(nav["search_pan_max_rad"]), limits.pan_lo, limits.pan_hi)
     tilt_rows = _resolve_tilt_rows(nav, limits)
-    slew_speed = float(nav.get("search_slew_speed_rad_per_s", 0.6))
+    slew_speed = float(nav.get("search_slew_speed_rad_per_s", 0.3))
+    slew_accel = float(nav.get("search_slew_accel_rad_per_s2", 0.8))
     max_sweeps = int(nav.get("max_search_sweeps", 3))
 
     detector.set_target(target_label)
@@ -510,11 +543,11 @@ def sweep_until_target(
     # so track() stays locked on one item instead of jumping between them.
     any_food_mode = detector.target_label == ""
     logger.info(
-        "sweep: target=%s pan=[%+.2f,%+.2f] tilt_rows=%s slew=%.2f rad/s max_sweeps=%d",
+        "sweep: target=%s pan=[%+.2f,%+.2f] tilt_rows=%s slew=%.2f rad/s a=%.2f rad/s^2 max_sweeps=%d",
         "(any food)" if any_food_mode else repr(target_label),
         pan_min, pan_max,
         "[" + ", ".join(f"{t:+.2f}" for t in tilt_rows) + "]",
-        slew_speed, max_sweeps,
+        slew_speed, slew_accel, max_sweeps,
     )
 
     pan_arrival_tol = 0.05  # rad; "stroke complete" tolerance
@@ -557,6 +590,7 @@ def sweep_until_target(
                 pan_target=stroke_end,
                 conf_min=tp.sweep_acquire_conf_min,
                 slew_speed_rad_per_s=slew_speed,
+                slew_accel_rad_per_s2=slew_accel,
                 pan_arrival_tol_rad=pan_arrival_tol,
                 time_budget_s=stroke_budget_s,
                 stop_event=stop_event,

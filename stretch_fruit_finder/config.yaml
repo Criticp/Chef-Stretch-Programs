@@ -32,7 +32,8 @@ navigation:
     - -1.0
     - -0.6
     - -0.2
-  search_slew_speed_rad_per_s: 0.6 # Pan slew rate during in-flight detection sweep
+  search_slew_speed_rad_per_s: 0.3 # Pan slew rate during in-flight detection sweep (rad/s — keep slow so YOLO can actually see fruit while moving)
+  search_slew_accel_rad_per_s2: 0.8 # Pan slew acceleration cap (rad/s^2 — gentle ramp avoids motion blur on direction reversals)
   search_pause_sec: 0.5            # (legacy) per-step dwell — unused by the continuous-slew sweep
   approach_stop_distance_m: 0.55   # Stop this far from target
   obstacle_min_distance_m: 0.5     # Minimum clear distance ahead
@@ -63,6 +64,8 @@ tracking:
   reacquire_extent_rad: 0.6        # How far the head slews along the last-seen direction looking for the target
   reacquire_budget_s: 2.0          # Time budget for the directional slew before declaring "officially lost"
   dt_predict_s: 0.5                # Look-ahead used when projecting where the target is "now" from its last sample
+  reacquire_speed_rad_per_s: 0.3   # Slew speed during the directional re-acquire (rad/s — same detection-friendly cap as sweep)
+  reacquire_accel_rad_per_s2: 0.8  # Slew acceleration cap during re-acquire (rad/s^2)
 
 arm:
   height_above_object_m: 0.15      # How far above the object to position the gripper
