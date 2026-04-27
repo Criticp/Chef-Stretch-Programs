@@ -65,6 +65,12 @@ class TrackerParams:
     stable_frames_drain: int = 2
     wait_command_in_track: bool = False
     verbose_first_n: int = 10
+    # Last-seen-direction memory + targeted re-acquire on loss.
+    trace_max_samples: int = 12
+    trace_max_age_s: float = 1.5
+    reacquire_extent_rad: float = 0.6
+    reacquire_budget_s: float = 2.0
+    dt_predict_s: float = 0.5
 
     @classmethod
     def from_config(cls, config: dict) -> "TrackerParams":
@@ -91,6 +97,15 @@ class TrackerParams:
                 trk.get("wait_command_in_track", defaults.wait_command_in_track)
             ),
             verbose_first_n=int(trk.get("verbose_first_n", defaults.verbose_first_n)),
+            trace_max_samples=int(trk.get("trace_max_samples", defaults.trace_max_samples)),
+            trace_max_age_s=float(trk.get("trace_max_age_s", defaults.trace_max_age_s)),
+            reacquire_extent_rad=float(
+                trk.get("reacquire_extent_rad", defaults.reacquire_extent_rad)
+            ),
+            reacquire_budget_s=float(
+                trk.get("reacquire_budget_s", defaults.reacquire_budget_s)
+            ),
+            dt_predict_s=float(trk.get("dt_predict_s", defaults.dt_predict_s)),
         )
 
 
@@ -100,6 +115,65 @@ class HeadLimits:
     pan_hi: float
     tilt_lo: float
     tilt_hi: float
+
+
+class TargetTrace:
+    """Bounded history of recent target observations in head-frame angles.
+
+    Each sample is (timestamp_s, abs_pan_rad, abs_tilt_rad) where the abs
+    angles are the target's angular position in the head frame, derived from
+    `head_pose + pan/tilt_sign * pixel_error_rad`. Used to estimate the
+    target's angular velocity so we can slew the head in the right direction
+    when the target slips off-screen.
+    """
+
+    def __init__(self, max_samples: int = 12, max_age_s: float = 1.5):
+        self.max_samples = max(2, int(max_samples))
+        self.max_age_s = float(max_age_s)
+        self._buf: list[tuple[float, float, float]] = []
+
+    def append(self, t: float, abs_pan: float, abs_tilt: float) -> None:
+        self._buf.append((t, abs_pan, abs_tilt))
+        cutoff = t - self.max_age_s
+        while self._buf and self._buf[0][0] < cutoff:
+            self._buf.pop(0)
+        while len(self._buf) > self.max_samples:
+            self._buf.pop(0)
+
+    def clear(self) -> None:
+        self._buf.clear()
+
+    def __len__(self) -> int:
+        return len(self._buf)
+
+    @property
+    def last(self) -> Optional[tuple[float, float, float]]:
+        return self._buf[-1] if self._buf else None
+
+
+def estimate_target_velocity(trace: TargetTrace) -> tuple[float, float]:
+    """Linear-regression slope of (abs_pan, abs_tilt) vs time over the trace.
+
+    Returns (vp_rad_per_s, vt_rad_per_s). Returns (0, 0) if too few samples
+    or too small a time span to make a meaningful estimate.
+    """
+    buf = trace._buf  # noqa: SLF001 — intentional internal access
+    if len(buf) < 3:
+        return (0.0, 0.0)
+    ts = np.asarray([s[0] for s in buf], dtype=float)
+    span = float(ts[-1] - ts[0])
+    if span < 0.2:
+        return (0.0, 0.0)
+    # Centre time so the regression is well-conditioned.
+    t = ts - ts.mean()
+    pans = np.asarray([s[1] for s in buf], dtype=float)
+    tilts = np.asarray([s[2] for s in buf], dtype=float)
+    denom = float(np.dot(t, t))
+    if denom <= 0.0:
+        return (0.0, 0.0)
+    vp = float(np.dot(t, pans - pans.mean()) / denom)
+    vt = float(np.dot(t, tilts - tilts.mean()) / denom)
+    return (vp, vt)
 
 
 # ----- helpers -------------------------------------------------------------
@@ -187,6 +261,210 @@ def center_head(
 # ----- loops ---------------------------------------------------------------
 
 
+def _resolve_tilt_rows(nav: dict, limits: HeadLimits) -> list[float]:
+    """Read `search_tilt_rows_rad` (preferred) or fall back to single `search_tilt_rad`."""
+    raw = nav.get("search_tilt_rows_rad")
+    if raw is None:
+        raw = [nav.get("search_tilt_rad", -0.6)]
+    if not isinstance(raw, (list, tuple)):
+        raw = [raw]
+    rows = [clamp(float(t), limits.tilt_lo, limits.tilt_hi) for t in raw]
+    # De-duplicate while preserving order; if everything collapses, keep one.
+    seen: list[float] = []
+    for t in rows:
+        if not seen or abs(t - seen[-1]) > 1e-3:
+            seen.append(t)
+    return seen or [clamp(-0.6, limits.tilt_lo, limits.tilt_hi)]
+
+
+def _slew_and_detect(
+    robot,
+    cam: CameraManager,
+    detector: FoodDetector,
+    *,
+    pan_target: float,
+    conf_min: float,
+    slew_speed_rad_per_s: float,
+    pan_arrival_tol_rad: float,
+    time_budget_s: float,
+    stop_event: threading.Event,
+    on_pose: PoseCallback,
+    robot_lock: Optional[threading.Lock],
+    tilt_target: Optional[float] = None,
+    tilt_arrival_tol_rad: float = 0.05,
+    poll_period_s: float = 0.03,
+) -> Optional[tuple[Detection, float, float]]:
+    """Slew head pan (and optionally tilt) non-blockingly while detecting.
+
+    Returns (detection, pan, tilt) on first hit at/above `conf_min`, or None
+    if the slew completes / stop_event fires / the time budget runs out.
+
+    On a hit, both pan and (if commanded) tilt are commanded back to the
+    live pose to halt the in-flight slew in place.
+    """
+    with _lock_ctx(robot_lock):
+        start_pan, start_tilt = read_head_pose(robot)
+        robot.head.move_to("head_pan", pan_target)
+        if tilt_target is not None:
+            robot.head.move_to("head_tilt", tilt_target)
+
+    pan_distance = abs(pan_target - start_pan)
+    tilt_distance = abs((tilt_target or start_tilt) - start_tilt)
+    distance = max(pan_distance, tilt_distance)
+    ideal_time = distance / max(0.05, slew_speed_rad_per_s)
+    deadline = time.time() + max(time_budget_s, ideal_time * 1.8 + 0.5)
+
+    last_log_pan: Optional[float] = None
+    while not stop_event.is_set():
+        if time.time() > deadline:
+            return None
+
+        color, _depth = cam.get_frames()
+        if color is None:
+            time.sleep(poll_period_s)
+            continue
+
+        with _lock_ctx(robot_lock):
+            real_pan, real_tilt = read_head_pose(robot)
+
+        detections = detector.detect(color)
+        if on_pose is not None:
+            try:
+                on_pose(color, detections, real_pan, real_tilt)
+            except Exception as exc:
+                logger.warning("on_pose callback raised: %s", exc)
+
+        target = pick_target(detections, conf_min)
+        if target is not None:
+            with _lock_ctx(robot_lock):
+                robot.head.move_to("head_pan", real_pan)
+                if tilt_target is not None:
+                    robot.head.move_to("head_tilt", real_tilt)
+            return (target, real_pan, real_tilt)
+
+        if last_log_pan is None or abs(real_pan - last_log_pan) > 0.5:
+            last_log_pan = real_pan
+            logger.debug("slew: pan=%+.2f -> %+.2f", real_pan, pan_target)
+
+        pan_arrived = abs(real_pan - pan_target) <= pan_arrival_tol_rad
+        tilt_arrived = (
+            tilt_target is None or abs(real_tilt - tilt_target) <= tilt_arrival_tol_rad
+        )
+        if pan_arrived and tilt_arrived:
+            return None
+
+        time.sleep(poll_period_s)
+
+    return None
+
+
+def reacquire_directional(
+    robot,
+    cam: CameraManager,
+    detector: FoodDetector,
+    tp: TrackerParams,
+    limits: HeadLimits,
+    *,
+    last_abs_pan: float,
+    last_abs_tilt: float,
+    vel: tuple[float, float],
+    stop_event: threading.Event,
+    on_pose: PoseCallback,
+    robot_lock: Optional[threading.Lock],
+) -> Optional[tuple[Detection, float, float]]:
+    """One-shot directional re-acquire after the tracker loses the target.
+
+    If the target had measurable angular velocity when it was last seen,
+    slew the head along that velocity vector for up to `reacquire_extent_rad`
+    (or `reacquire_budget_s`, whichever ends first), running the detector in
+    flight. If the target was effectively static, do a small symmetric scan
+    around the last known pan position instead.
+
+    Returns (detection, pan, tilt) on first hit at/above `target_conf_min`,
+    or None if the move completes / budget runs out / stop_event fires.
+    """
+    vp, vt = vel
+    speed = float(np.hypot(vp, vt))
+    extent = max(0.1, tp.reacquire_extent_rad)
+    moving = speed > 0.05  # rad/s — anything less is treated as "stationary"
+
+    if moving:
+        # Predict where the target is "now" (dt_predict ahead of last sample),
+        # then extend along the same direction up to the full extent.
+        dt = max(0.0, tp.dt_predict_s)
+        pred_pan = last_abs_pan + vp * dt
+        pred_tilt = last_abs_tilt + vt * dt
+        # Direction unit vector in (pan, tilt) space.
+        ux = vp / speed
+        uy = vt / speed
+        end_pan = clamp(pred_pan + ux * extent, limits.pan_lo, limits.pan_hi)
+        end_tilt = clamp(pred_tilt + uy * extent, limits.tilt_lo, limits.tilt_hi)
+
+        logger.info(
+            "reacquire(directional): vel=(%+.2f, %+.2f) rad/s last=(%+.2f, %+.2f) -> end=(%+.2f, %+.2f)",
+            vp, vt, last_abs_pan, last_abs_tilt, end_pan, end_tilt,
+        )
+
+        # Take a moderate slew speed so we can both move and detect.
+        slew_speed = max(0.4, min(1.2, speed * 1.5 + 0.3))
+
+        return _slew_and_detect(
+            robot, cam, detector,
+            pan_target=end_pan,
+            tilt_target=end_tilt,
+            conf_min=tp.target_conf_min,
+            slew_speed_rad_per_s=slew_speed,
+            pan_arrival_tol_rad=0.05,
+            time_budget_s=tp.reacquire_budget_s,
+            stop_event=stop_event,
+            on_pose=on_pose,
+            robot_lock=robot_lock,
+        )
+
+    # Stationary fallback: small symmetric scan around the last position.
+    half = extent * 0.5
+    left = clamp(last_abs_pan - half, limits.pan_lo, limits.pan_hi)
+    right = clamp(last_abs_pan + half, limits.pan_lo, limits.pan_hi)
+    tilt_hold = clamp(last_abs_tilt, limits.tilt_lo, limits.tilt_hi)
+
+    logger.info(
+        "reacquire(scan): no velocity, scanning pan [%+.2f, %+.2f] at tilt %+.2f",
+        left, right, tilt_hold,
+    )
+
+    half_budget = max(0.5, tp.reacquire_budget_s * 0.5)
+    slew_speed = 0.5
+
+    # Sweep left, then right of the last-known position.
+    hit = _slew_and_detect(
+        robot, cam, detector,
+        pan_target=left,
+        tilt_target=tilt_hold,
+        conf_min=tp.target_conf_min,
+        slew_speed_rad_per_s=slew_speed,
+        pan_arrival_tol_rad=0.05,
+        time_budget_s=half_budget,
+        stop_event=stop_event,
+        on_pose=on_pose,
+        robot_lock=robot_lock,
+    )
+    if hit is not None or stop_event.is_set():
+        return hit
+
+    return _slew_and_detect(
+        robot, cam, detector,
+        pan_target=right,
+        tilt_target=tilt_hold,
+        conf_min=tp.target_conf_min,
+        slew_speed_rad_per_s=slew_speed,
+        pan_arrival_tol_rad=0.05,
+        time_budget_s=half_budget,
+        stop_event=stop_event,
+        on_pose=on_pose,
+        robot_lock=robot_lock,
+    )
+
+
 def sweep_until_target(
     robot,
     cam: CameraManager,
@@ -199,10 +477,22 @@ def sweep_until_target(
     robot_lock: Optional[threading.Lock] = None,
 ) -> Optional[tuple[Detection, float, float]]:
     """
-    Pan the head through the configured search range, running the detector
-    at each pose. Returns (detection, pan, tilt) as soon as a target-class
-    detection fires above the acquire threshold, or None if stop_event is
-    set or the full sweep completes with no target.
+    Continuous-slew search across pan x multiple tilt rows.
+
+    The head pan is commanded across `[search_pan_min_rad, search_pan_max_rad]`
+    without waiting for arrival, and the detector runs in flight on every
+    fresh camera frame. On any detection above `sweep_acquire_conf_min`,
+    motion is halted in place and (detection, pan, tilt) is returned.
+
+    Tilt rows come from `search_tilt_rows_rad` (list) — defaults to floor /
+    mid / counter-and-hand height — so a single sweep covers fruit at
+    multiple heights, not just on the floor. After every tilt row is
+    visited, that counts as one "full sweep"; up to `max_search_sweeps`
+    full sweeps are attempted before giving up. Pan direction alternates
+    each row (boustrophedon) so we don't jump from one extreme back to the
+    other between rows.
+
+    Returns None if `stop_event` is set or all sweeps complete with no hit.
     """
     nav = config["navigation"]
     tp = TrackerParams.from_config(config)
@@ -210,9 +500,8 @@ def sweep_until_target(
 
     pan_min = clamp(float(nav["search_pan_min_rad"]), limits.pan_lo, limits.pan_hi)
     pan_max = clamp(float(nav["search_pan_max_rad"]), limits.pan_lo, limits.pan_hi)
-    pan_step = float(nav["search_pan_step_rad"])
-    tilt_target = clamp(float(nav["search_tilt_rad"]), limits.tilt_lo, limits.tilt_hi)
-    dwell = float(nav["search_pause_sec"])
+    tilt_rows = _resolve_tilt_rows(nav, limits)
+    slew_speed = float(nav.get("search_slew_speed_rad_per_s", 0.6))
     max_sweeps = int(nav.get("max_search_sweeps", 3))
 
     detector.set_target(target_label)
@@ -221,59 +510,63 @@ def sweep_until_target(
     # so track() stays locked on one item instead of jumping between them.
     any_food_mode = detector.target_label == ""
     logger.info(
-        "sweep: target=%s pan=[%+.2f,%+.2f] step=%+.2f tilt=%+.2f dwell=%.2f max_sweeps=%d",
+        "sweep: target=%s pan=[%+.2f,%+.2f] tilt_rows=%s slew=%.2f rad/s max_sweeps=%d",
         "(any food)" if any_food_mode else repr(target_label),
-        pan_min, pan_max, pan_step, tilt_target, dwell, max_sweeps,
+        pan_min, pan_max,
+        "[" + ", ".join(f"{t:+.2f}" for t in tilt_rows) + "]",
+        slew_speed, max_sweeps,
     )
 
-    # Move to search tilt + center pan before the sweep.
-    with _lock_ctx(robot_lock):
-        robot.head.move_to("head_pan", 0.0)
-        robot.head.move_to("head_tilt", tilt_target)
-        robot.wait_command()
-    time.sleep(0.2)
-    drain_frames(cam, warmup_frames)
+    pan_arrival_tol = 0.05  # rad; "stroke complete" tolerance
+    # Time budget per stroke — generous fallback if move_to never reports arrival.
+    stroke_budget_s = max(3.0, (pan_max - pan_min) / max(0.05, slew_speed) * 1.8 + 1.0)
 
-    n_poses = max(2, int(round((pan_max - pan_min) / pan_step)) + 1)
-
+    pan_extremes = (pan_min, pan_max)
+    # Start each new full sweep at the same end so coverage is symmetric.
     for sweep_n in range(max_sweeps):
         if stop_event.is_set():
             return None
 
-        # Alternate direction so we don't jump from one end back to the other.
-        if sweep_n % 2 == 0:
-            angles = [pan_min + i * pan_step for i in range(n_poses)]
-        else:
-            angles = [pan_max - i * pan_step for i in range(n_poses)]
-
-        for pan in angles:
+        for row_idx, tilt_target in enumerate(tilt_rows):
             if stop_event.is_set():
                 return None
-            pan = clamp(pan, limits.pan_lo, limits.pan_hi)
 
+            # Boustrophedon: alternate pan direction across rows AND across sweeps.
+            forward = ((sweep_n + row_idx) % 2) == 0
+            stroke_start, stroke_end = (pan_extremes[0], pan_extremes[1]) if forward else (pan_extremes[1], pan_extremes[0])
+
+            # Pre-position to the stroke start + this row's tilt before slewing.
             with _lock_ctx(robot_lock):
-                robot.head.move_to("head_pan", pan)
+                robot.head.move_to("head_pan", stroke_start)
+                robot.head.move_to("head_tilt", tilt_target)
                 robot.wait_command()
-            time.sleep(dwell)
+            time.sleep(0.15)
+            drain_frames(cam, warmup_frames)
 
-            color, _depth = drain_frames(cam, warmup_frames)
-            if color is None:
-                continue
+            if stop_event.is_set():
+                return None
 
-            with _lock_ctx(robot_lock):
-                real_pan, real_tilt = read_head_pose(robot)
-            detections = detector.detect(color)
+            logger.info(
+                "sweep[%d/%d row=%d tilt=%+.2f]: slewing pan %+.2f -> %+.2f",
+                sweep_n + 1, max_sweeps, row_idx, tilt_target,
+                stroke_start, stroke_end,
+            )
 
-            if on_pose is not None:
-                try:
-                    on_pose(color, detections, real_pan, real_tilt)
-                except Exception as exc:
-                    logger.warning("on_pose callback raised: %s", exc)
+            hit = _slew_and_detect(
+                robot, cam, detector,
+                pan_target=stroke_end,
+                conf_min=tp.sweep_acquire_conf_min,
+                slew_speed_rad_per_s=slew_speed,
+                pan_arrival_tol_rad=pan_arrival_tol,
+                time_budget_s=stroke_budget_s,
+                stop_event=stop_event,
+                on_pose=on_pose,
+                robot_lock=robot_lock,
+            )
 
-            target = pick_target(detections, tp.sweep_acquire_conf_min)
-            if target is not None:
+            if hit is not None:
+                target, real_pan, real_tilt = hit
                 if any_food_mode:
-                    # Lock the detector onto this specific label for track().
                     detector.set_target(target.label)
                     logger.info(
                         "sweep: narrowed target from (any food) to %r",
@@ -318,6 +611,13 @@ def track(
     max_step. The next detection checks whether error shrank; if it grew,
     the offending sign is auto-flipped. After that, probing ends.
 
+    Loss handling: every successful detection appends the target's absolute
+    head-frame angle to a `TargetTrace`. When the target is missing for
+    `lost_frames_timeout` consecutive frames, a single-shot directional
+    re-acquire slews the head along the target's last estimated velocity
+    (or scans symmetrically around the last position if it was static)
+    before declaring the target officially lost.
+
     Returns: "stopped", "lost", or "error".
     """
     tp = params or TrackerParams.from_config(config)
@@ -326,10 +626,11 @@ def track(
     logger.info(
         "track: kp=%.2f max_step=%.2f deadband=%.3f lost_timeout=%d "
         "pan_sign=%+d tilt_sign=%+d rad_per_px=(%.5f, %.5f) "
-        "auto_sign_flip=%s stable_drain=%d",
+        "auto_sign_flip=%s stable_drain=%d reacquire_extent=%.2f budget=%.2fs",
         tp.kp, tp.max_step_rad, tp.deadband_rad, tp.lost_frames_timeout,
         int(tp.pan_sign), int(tp.tilt_sign), rpp_x, rpp_y,
         tp.auto_sign_flip, tp.stable_frames_drain,
+        tp.reacquire_extent_rad, tp.reacquire_budget_s,
     )
 
     lost_frames = 0
@@ -340,6 +641,10 @@ def track(
     probe_done = not tp.auto_sign_flip
     probe_err_before: tuple[float, float] | None = None
     probe_delta: tuple[float, float] = (0.0, 0.0)
+
+    # Target trace (last-seen direction memory) + one-shot re-acquire flag.
+    trace = TargetTrace(tp.trace_max_samples, tp.trace_max_age_s)
+    reacquire_attempted = False
 
     while not stop_event.is_set():
         # Stable frame: drain a few so we don't detect on a motion-blurred one.
@@ -368,7 +673,35 @@ def track(
                     iteration, lost_frames, tp.lost_frames_timeout,
                 )
             if lost_frames >= tp.lost_frames_timeout:
-                logger.info("track: target lost for %d frames; exiting", lost_frames)
+                if not reacquire_attempted and trace.last is not None:
+                    reacquire_attempted = True
+                    vel = estimate_target_velocity(trace)
+                    _, last_abs_pan, last_abs_tilt = trace.last
+                    logger.info(
+                        "track: target lost for %d frames; attempting directional re-acquire",
+                        lost_frames,
+                    )
+                    hit = reacquire_directional(
+                        robot, cam, detector, tp, limits,
+                        last_abs_pan=last_abs_pan,
+                        last_abs_tilt=last_abs_tilt,
+                        vel=vel,
+                        stop_event=stop_event,
+                        on_pose=on_pose,
+                        robot_lock=robot_lock,
+                    )
+                    if hit is not None:
+                        logger.info(
+                            "track: re-acquired %r at pan=%+.2f tilt=%+.2f conf=%.2f",
+                            hit[0].label, hit[1], hit[2], hit[0].confidence,
+                        )
+                        lost_frames = 0
+                        trace.clear()
+                        iteration += 1
+                        continue
+                    logger.info("track: directional re-acquire failed; target lost")
+                else:
+                    logger.info("track: target lost for %d frames; exiting", lost_frames)
                 reason = "lost"
                 break
             iteration += 1
@@ -382,6 +715,16 @@ def track(
         err_y_px = float(cy - h / 2.0)
         err_x_rad = err_x_px * rpp_x
         err_y_rad = err_y_px * rpp_y
+
+        # Record where the target is in head-frame angles, for velocity
+        # estimation if it slips off-screen later. Using the same sign
+        # convention as the controller so the resulting velocity matches
+        # the head-pan axis.
+        trace.append(
+            time.time(),
+            real_pan + tp.pan_sign * err_x_rad,
+            real_tilt + tp.tilt_sign * err_y_rad,
+        )
 
         # --- sign verification (runs on the first detection AFTER a probe move) ---
         if not probe_done and probe_err_before is not None:

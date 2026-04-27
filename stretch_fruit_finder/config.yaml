@@ -26,14 +26,19 @@ detection:
 navigation:
   search_pan_min_rad: -1.5         # Head pan sweep start
   search_pan_max_rad: 1.5          # Head pan sweep end
-  search_pan_step_rad: 0.3         # Head pan increment per step
-  search_tilt_rad: -0.6            # Head tilt during search (negative = look down)
-  search_pause_sec: 0.5            # Pause at each pan step for detection
+  search_pan_step_rad: 0.3         # (legacy) Pan step — unused by the continuous-slew sweep
+  search_tilt_rad: -0.6            # (legacy) Single-row tilt — used only if search_tilt_rows_rad is unset
+  search_tilt_rows_rad:            # Tilt rows the sweep visits in order (floor / mid / counter+hand height)
+    - -1.0
+    - -0.6
+    - -0.2
+  search_slew_speed_rad_per_s: 0.6 # Pan slew rate during in-flight detection sweep
+  search_pause_sec: 0.5            # (legacy) per-step dwell — unused by the continuous-slew sweep
   approach_stop_distance_m: 0.55   # Stop this far from target
   obstacle_min_distance_m: 0.5     # Minimum clear distance ahead
   explore_rotate_rad: 1.05         # ~60 degrees rotation when exploring
   explore_translate_m: 0.4         # Forward step when exploring
-  max_search_sweeps: 3             # Full head sweeps before giving up in one location
+  max_search_sweeps: 3             # Full multi-tilt sweeps before giving up in one location
   max_explore_steps: 5             # Explore attempts before returning to IDLE
   use_map: false                   # Set true and provide map_file for map-based nav
   map_file: ""                     # Path to .npz map file
@@ -52,6 +57,12 @@ tracking:
   stable_frames_drain: 2           # Drain this many frames each iteration to skip motion-blurred ones
   wait_command_in_track: false     # If true, wait for each head move to finish before re-detecting (slow but ultra-stable)
   verbose_first_n: 10              # Per-iteration detailed logging for the first N track frames
+  # Last-seen-direction memory + one-shot directional re-acquire on loss.
+  trace_max_samples: 12            # Cap on the rolling target-position history used for velocity estimation
+  trace_max_age_s: 1.5             # Drop samples older than this from the trace
+  reacquire_extent_rad: 0.6        # How far the head slews along the last-seen direction looking for the target
+  reacquire_budget_s: 2.0          # Time budget for the directional slew before declaring "officially lost"
+  dt_predict_s: 0.5                # Look-ahead used when projecting where the target is "now" from its last sample
 
 arm:
   height_above_object_m: 0.15      # How far above the object to position the gripper
