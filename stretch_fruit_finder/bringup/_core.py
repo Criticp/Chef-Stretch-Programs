@@ -922,37 +922,40 @@ def _safe_call(label: str, fn) -> None:
         logger.warning("hover: %s failed: %s", label, exc)
 
 
-def _read_arm_pos(robot) -> float:
+def _read_joint_pos(robot, joint_attr: str) -> float:
     try:
-        return float(robot.arm.status.get("pos", 0.0))
+        return float(getattr(robot, joint_attr).status.get("pos", 0.0))
     except Exception:
         return 0.0
 
 
-def _halt_arm(robot, robot_lock: Optional[threading.Lock], v: float, a: float) -> None:
-    """Stop the arm in place by commanding it to its current position.
+def _halt_joint(robot, joint_attr: str, robot_lock: Optional[threading.Lock], v: float, a: float) -> None:
+    """Stop the named stepper joint in place by commanding it to its current position.
 
     Acquires the lock so other threads see a coherent stopped state.
+    Works for `robot.arm` and `robot.lift` (they share the same API).
     """
     with _lock_ctx(robot_lock):
-        cur = _read_arm_pos(robot)
-        _safe_call("arm.halt", lambda: robot.arm.move_to(cur, v, a))
-        _safe_call("push_command(halt)", robot.push_command)
+        cur = _read_joint_pos(robot, joint_attr)
+        _safe_call(f"{joint_attr}.halt",
+                   lambda: getattr(robot, joint_attr).move_to(cur, v, a))
+        _safe_call(f"push_command({joint_attr}.halt)", robot.push_command)
 
 
-def _scan_arm_for_visibility(
+def _scan_joint_for_visibility(
     robot,
+    joint_attr: str,
     cam: CameraManager,
     detector: FoodDetector,
     *,
-    arm_pos_target: float,
+    target_pos: float,
     scan_v: float,
     scan_a: float,
     halt_v: float,
     halt_a: float,
     target_conf_min: float,
     wait_for: str,
-    arrival_tol_m: float = 0.005,
+    arrival_tol: float = 0.005,
     transition_threshold: int = 3,
     poll_period_s: float = 0.03,
     time_budget_s: float = 30.0,
@@ -960,7 +963,8 @@ def _scan_arm_for_visibility(
     on_pose: PoseCallback,
     robot_lock: Optional[threading.Lock],
 ) -> str:
-    """Slew the arm at scan speed while watching the detector for a visibility transition.
+    """Slew the named stepper joint (arm or lift) at scan speed, watching the
+    detector for a target-visibility transition.
 
     `wait_for` selects the state machine:
       - "reveal_after_occlusion": expects target visible at start. Returns
@@ -970,35 +974,36 @@ def _scan_arm_for_visibility(
         threshold count.
 
     Returns one of:
-      "passed"        — desired transition occurred; arm is halted in place.
-      "max_reached"   — arm reached `arm_pos_target` without the transition.
-      "stopped"       — stop_event fired; arm halted.
-      "timeout"       — `time_budget_s` expired; arm halted.
+      "passed"        — desired transition occurred; joint is halted in place.
+      "max_reached"   — joint reached `target_pos` without the transition.
+      "stopped"       — stop_event fired; joint halted.
+      "timeout"       — `time_budget_s` expired; joint halted.
     """
     assert wait_for in ("reveal_after_occlusion", "occlusion"), wait_for
 
     with _lock_ctx(robot_lock):
-        start_pos = _read_arm_pos(robot)
-        _safe_call("arm.move_to(scan)",
-                   lambda: robot.arm.move_to(arm_pos_target, scan_v, scan_a))
-        _safe_call("push_command(scan)", robot.push_command)
+        start_pos = _read_joint_pos(robot, joint_attr)
+        _safe_call(f"{joint_attr}.move_to(scan)",
+                   lambda: getattr(robot, joint_attr).move_to(target_pos, scan_v, scan_a))
+        _safe_call(f"push_command({joint_attr}.scan)", robot.push_command)
 
     state = "INITIAL_VISIBLE" if wait_for == "reveal_after_occlusion" else "WAIT_OCCLUDE"
     consecutive_lost = 0
     consecutive_visible = 0
 
-    direction = 1 if arm_pos_target > start_pos else -1
+    direction = 1 if target_pos > start_pos else -1
     deadline = time.time() + time_budget_s
 
     logger.info(
-        "scan: %s arm %.2f -> %.2f (v=%.2f) state=%s",
-        wait_for, start_pos, arm_pos_target, scan_v, state,
+        "scan(%s): %s %.3f -> %.3f (v=%.2f) state=%s",
+        joint_attr, wait_for, start_pos, target_pos, scan_v, state,
     )
 
     while not stop_event.is_set():
         if time.time() > deadline:
-            _halt_arm(robot, robot_lock, halt_v, halt_a)
-            logger.warning("scan: timed out after %.1fs in state %s", time_budget_s, state)
+            _halt_joint(robot, joint_attr, robot_lock, halt_v, halt_a)
+            logger.warning("scan(%s): timed out after %.1fs in state %s",
+                           joint_attr, time_budget_s, state)
             return "timeout"
 
         color, _depth = cam.get_frames()
@@ -1008,7 +1013,7 @@ def _scan_arm_for_visibility(
 
         with _lock_ctx(robot_lock):
             real_pan, real_tilt = read_head_pose(robot)
-            arm_pos = _read_arm_pos(robot)
+            cur_pos = _read_joint_pos(robot, joint_attr)
 
         detections = detector.detect(color)
         if on_pose is not None:
@@ -1023,7 +1028,8 @@ def _scan_arm_for_visibility(
             if not target_seen:
                 consecutive_lost += 1
                 if consecutive_lost >= transition_threshold:
-                    logger.info("scan: occluded at arm=%.3f — waiting for reveal", arm_pos)
+                    logger.info("scan(%s): occluded at %.3f — waiting for reveal",
+                                joint_attr, cur_pos)
                     state = "WAIT_REVEAL"
                     consecutive_lost = 0
             else:
@@ -1032,8 +1038,8 @@ def _scan_arm_for_visibility(
             if target_seen:
                 consecutive_visible += 1
                 if consecutive_visible >= transition_threshold:
-                    _halt_arm(robot, robot_lock, halt_v, halt_a)
-                    logger.info("scan: revealed at arm=%.3f", arm_pos)
+                    _halt_joint(robot, joint_attr, robot_lock, halt_v, halt_a)
+                    logger.info("scan(%s): revealed at %.3f", joint_attr, cur_pos)
                     return "passed"
             else:
                 consecutive_visible = 0
@@ -1041,24 +1047,25 @@ def _scan_arm_for_visibility(
             if not target_seen:
                 consecutive_lost += 1
                 if consecutive_lost >= transition_threshold:
-                    _halt_arm(robot, robot_lock, halt_v, halt_a)
-                    logger.info("scan: occluded at arm=%.3f", arm_pos)
+                    _halt_joint(robot, joint_attr, robot_lock, halt_v, halt_a)
+                    logger.info("scan(%s): occluded at %.3f", joint_attr, cur_pos)
                     return "passed"
             else:
                 consecutive_lost = 0
 
-        # Detect "we've reached the move-to target" — direction-aware so we
-        # don't false-trigger when the arm overshoots a tiny bit then comes back.
-        if direction > 0 and arm_pos >= arm_pos_target - arrival_tol_m:
-            logger.info("scan: reached target arm=%.3f without transition (state=%s)", arm_pos, state)
+        # Direction-aware arrival check.
+        if direction > 0 and cur_pos >= target_pos - arrival_tol:
+            logger.info("scan(%s): reached target %.3f without transition (state=%s)",
+                        joint_attr, cur_pos, state)
             return "max_reached"
-        if direction < 0 and arm_pos <= arm_pos_target + arrival_tol_m:
-            logger.info("scan: reached target arm=%.3f without transition (state=%s)", arm_pos, state)
+        if direction < 0 and cur_pos <= target_pos + arrival_tol:
+            logger.info("scan(%s): reached target %.3f without transition (state=%s)",
+                        joint_attr, cur_pos, state)
             return "max_reached"
 
         time.sleep(poll_period_s)
 
-    _halt_arm(robot, robot_lock, halt_v, halt_a)
+    _halt_joint(robot, joint_attr, robot_lock, halt_v, halt_a)
     return "stopped"
 
 
@@ -1119,18 +1126,20 @@ def hover_above_target(
 
     arm_cfg = config.get("arm", {}) or {}
     max_extension = float(arm_cfg.get("max_extension_m", 0.5))
-    height_above = float(arm_cfg.get("height_above_object_m", 0.15))
-    min_lift = float(arm_cfg.get("min_lift_m", 0.05))
     max_lift = float(arm_cfg.get("max_lift_m", 1.05))
+    stow_lift = float(arm_cfg.get("stow_lift_m", 0.6))
+    grip_pct = float(arm_cfg.get("stow_gripper_pct", 25.0))  # slightly-closed for clean occlusion
 
     trk_cfg = config.get("tracking", {}) or {}
     target_conf_min = float(trk_cfg.get("target_conf_min", 0.25))
 
     # Slow scan envelope so the detector at ~5 Hz has multiple frames per
-    # cm of arm motion. Hard-coded here (not in config) to keep the visual
+    # cm of motion. Hard-coded here (not in config) to keep the visual
     # servo predictable; promote to config if we want to tune later.
-    scan_v = 0.05
-    scan_a = 0.2
+    scan_v_arm = 0.05
+    scan_a_arm = 0.2
+    scan_v_lift = 0.05
+    scan_a_lift = 0.2
 
     if stop_event.is_set():
         return "stopped"
@@ -1176,7 +1185,7 @@ def hover_above_target(
         )
         commands = arm_controller.position_above_unreachable(z_up)
         cmd_by_joint = {c.joint: c.value for c in commands}
-        lift_target_unreachable = float(cmd_by_joint.get("lift", 0.6))
+        lift_target_unreachable = float(cmd_by_joint.get("lift", stow_lift))
         with _lock_ctx(robot_lock):
             _safe_call("wrist_yaw",
                        lambda: robot.end_of_arm.move_to("wrist_yaw", 0.0, wrist_v, wrist_a))
@@ -1184,8 +1193,8 @@ def hover_above_target(
                        lambda: robot.end_of_arm.move_to("wrist_pitch", 0.0, wrist_v, wrist_a))
             _safe_call("wrist_roll",
                        lambda: robot.end_of_arm.move_to("wrist_roll", 0.0, wrist_v, wrist_a))
-            _safe_call("gripper.open",
-                       lambda: robot.end_of_arm.move_to("stretch_gripper", 50.0, grip_v, grip_a))
+            _safe_call("gripper.set",
+                       lambda: robot.end_of_arm.move_to("stretch_gripper", grip_pct, grip_v, grip_a))
             _safe_call("arm.retract",
                        lambda: robot.arm.move_to(0.0, arm_v_halt, arm_a_halt))
             _safe_call("push_command", robot.push_command)
@@ -1196,10 +1205,10 @@ def hover_above_target(
             _safe_call("wait_command(lift)", robot.wait_command)
         return "hovered"
 
-    # Right-side: visual servo path.
-    lift_target = clamp(z_up + height_above, min_lift, max_lift)
+    # Right-side: full visual-servo path. Lift first to find the right
+    # height, then arm extension to find the right lateral position.
 
-    # 1. Pose wrist outward + open gripper (non-blocking Dynamixels).
+    # 1. Pose wrist outward + apply slightly-closed gripper.
     if stop_event.is_set():
         return "stopped"
     with _lock_ctx(robot_lock):
@@ -1209,27 +1218,48 @@ def hover_above_target(
                    lambda: robot.end_of_arm.move_to("wrist_pitch", 0.0, wrist_v, wrist_a))
         _safe_call("wrist_roll",
                    lambda: robot.end_of_arm.move_to("wrist_roll", 0.0, wrist_v, wrist_a))
-        _safe_call("gripper.open",
-                   lambda: robot.end_of_arm.move_to("stretch_gripper", 50.0, grip_v, grip_a))
+        _safe_call("gripper.set",
+                   lambda: robot.end_of_arm.move_to("stretch_gripper", grip_pct, grip_v, grip_a))
 
-    # 2. Lift to clearance height first; block so the arm scan happens at the right z.
     if stop_event.is_set():
         return "stopped"
-    with _lock_ctx(robot_lock):
-        _safe_call("lift.move_to",
-                   lambda: robot.lift.move_to(lift_target, lift_v, lift_a))
-        _safe_call("push_command(lift)", robot.push_command)
-        _safe_call("wait_command(lift)", robot.wait_command)
+
+    # 2. Lift visual servo: lift until the gripper occludes the fruit.
+    #    The lift starts from wherever the arm currently is (typically
+    #    stow_lift after a Stow press) and rises to find the height at
+    #    which the gripper crosses the camera-to-fruit line of sight.
+    logger.info("hover: phase 0 — lift visual servo to find correct height")
+    lift_result = _scan_joint_for_visibility(
+        robot, "lift", cam, detector,
+        target_pos=max_lift,
+        scan_v=scan_v_lift, scan_a=scan_a_lift,
+        halt_v=lift_v, halt_a=lift_a,
+        target_conf_min=target_conf_min,
+        wait_for="occlusion",
+        stop_event=stop_event,
+        on_pose=on_pose,
+        robot_lock=robot_lock,
+    )
+    if lift_result == "stopped":
+        return "stopped"
+    if lift_result != "passed":
+        logger.warning("hover: lift phase ended as %r — lowering back to stow_lift", lift_result)
+        with _lock_ctx(robot_lock):
+            _safe_call("lift.recover",
+                       lambda: robot.lift.move_to(stow_lift, lift_v, lift_a))
+            _safe_call("push_command(lift recover)", robot.push_command)
+            _safe_call("wait_command(lift recover)", robot.wait_command)
+        return "lift_no_cover"
 
     if stop_event.is_set():
         return "stopped"
 
     # 3. Phase A — extend until the fruit reappears past the gripper.
     logger.info("hover: phase A — extending to find reveal-after-occlusion")
-    extend_result = _scan_arm_for_visibility(
-        robot, cam, detector,
-        arm_pos_target=max_extension,
-        scan_v=scan_v, scan_a=scan_a,
+    extend_result = _scan_joint_for_visibility(
+        robot, "arm", cam, detector,
+        target_pos=max_extension,
+        scan_v=scan_v_arm, scan_a=scan_a_arm,
         halt_v=arm_v_halt, halt_a=arm_a_halt,
         target_conf_min=target_conf_min,
         wait_for="reveal_after_occlusion",
@@ -1253,10 +1283,10 @@ def hover_above_target(
 
     # 4. Phase B — retract until the fruit becomes occluded again.
     logger.info("hover: phase B — retracting to find first occlusion")
-    retract_result = _scan_arm_for_visibility(
-        robot, cam, detector,
-        arm_pos_target=0.0,
-        scan_v=scan_v, scan_a=scan_a,
+    retract_result = _scan_joint_for_visibility(
+        robot, "arm", cam, detector,
+        target_pos=0.0,
+        scan_v=scan_v_arm, scan_a=scan_a_arm,
         halt_v=arm_v_halt, halt_a=arm_a_halt,
         target_conf_min=target_conf_min,
         wait_for="occlusion",
@@ -1270,8 +1300,10 @@ def hover_above_target(
         logger.warning("hover: retract phase ended as %r", retract_result)
         return "retract_no_cover"
 
-    final_arm = _read_arm_pos(robot)
-    logger.info("hover: complete (lift=%.2f arm=%.3f, gripper-occlusion locked)", lift_target, final_arm)
+    final_lift = _read_joint_pos(robot, "lift")
+    final_arm = _read_joint_pos(robot, "arm")
+    logger.info("hover: complete (lift=%.3f arm=%.3f, gripper-occlusion locked)",
+                final_lift, final_arm)
     return "hovered"
 
 
