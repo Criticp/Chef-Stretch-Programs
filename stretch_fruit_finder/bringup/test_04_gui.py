@@ -123,11 +123,22 @@ class Worker(threading.Thread):
         self.shutdown_event = shutdown_event
         self.robot_lock = robot_lock
         self._stop_current = threading.Event()  # stops the current sweep/track loop
+        # Set by request_hover() so the start-block doesn't re-centre the
+        # head between exiting track() and the queued ("hover",) command.
+        self._suppress_recentre = False
         # Stateless math for the "Hover above target" button.
         from fruit_finder.arm_controller import ArmController  # local to avoid a top-of-module cycle
         self.arm_controller = ArmController(config)
 
     def stop_current(self) -> None:
+        self._stop_current.set()
+
+    def request_hover(self) -> None:
+        """Enqueue a hover command and break the active track loop so the
+        Worker can pick it up. Suppresses the post-track head re-centre
+        so the gripper hovers above where the head was actually locked."""
+        self._suppress_recentre = True
+        self.command_q.put(("hover",))
         self._stop_current.set()
 
     def _publish_state(self, name: str) -> None:
@@ -241,14 +252,18 @@ class Worker(threading.Thread):
 
                 self.event_q.put(("log", f"Track ended: {reason}"))
                 self._publish_state("IDLE")
-                _core.center_head(self.robot, robot_lock=self.robot_lock)
+                if self._suppress_recentre:
+                    # A hover request is queued — leave the head where
+                    # track left it so hover_above_target reads the
+                    # actual lock-on pose.
+                    self._suppress_recentre = False
+                else:
+                    _core.center_head(self.robot, robot_lock=self.robot_lock)
 
             if cmd[0] == "hover":
-                # Stop any active track loop so the head freezes at its
-                # current lock-on pose. Brief sleep lets the in-flight
-                # iteration of track() observe the stop_event and return.
-                self._stop_current.set()
-                time.sleep(0.1)
+                # The track loop has already exited (request_hover set
+                # _stop_current); clear it so this branch's own loops
+                # can run.
                 self._stop_current.clear()
                 self._publish_state("HOVERING")
 
@@ -617,7 +632,10 @@ class FruitFinderGUI:
         self._log("Stow arm requested")
 
     def _on_hover(self) -> None:
-        self.command_q.put(("hover",))
+        # Worker.request_hover() enqueues the command AND breaks the active
+        # track loop, otherwise the worker would stay blocked inside track()
+        # and never drain the queue.
+        self.worker.request_hover()
         self._log("Hover above target requested")
 
     def _on_stop(self) -> None:
