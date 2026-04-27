@@ -922,6 +922,146 @@ def _safe_call(label: str, fn) -> None:
         logger.warning("hover: %s failed: %s", label, exc)
 
 
+def _read_arm_pos(robot) -> float:
+    try:
+        return float(robot.arm.status.get("pos", 0.0))
+    except Exception:
+        return 0.0
+
+
+def _halt_arm(robot, robot_lock: Optional[threading.Lock], v: float, a: float) -> None:
+    """Stop the arm in place by commanding it to its current position.
+
+    Acquires the lock so other threads see a coherent stopped state.
+    """
+    with _lock_ctx(robot_lock):
+        cur = _read_arm_pos(robot)
+        _safe_call("arm.halt", lambda: robot.arm.move_to(cur, v, a))
+        _safe_call("push_command(halt)", robot.push_command)
+
+
+def _scan_arm_for_visibility(
+    robot,
+    cam: CameraManager,
+    detector: FoodDetector,
+    *,
+    arm_pos_target: float,
+    scan_v: float,
+    scan_a: float,
+    halt_v: float,
+    halt_a: float,
+    target_conf_min: float,
+    wait_for: str,
+    arrival_tol_m: float = 0.005,
+    transition_threshold: int = 3,
+    poll_period_s: float = 0.03,
+    time_budget_s: float = 30.0,
+    stop_event: threading.Event,
+    on_pose: PoseCallback,
+    robot_lock: Optional[threading.Lock],
+) -> str:
+    """Slew the arm at scan speed while watching the detector for a visibility transition.
+
+    `wait_for` selects the state machine:
+      - "reveal_after_occlusion": expects target visible at start. Returns
+        "passed" when the target has been LOST for `transition_threshold`
+        consecutive cycles AND THEN visible again for the same threshold.
+      - "occlusion": returns "passed" when the target is lost for the
+        threshold count.
+
+    Returns one of:
+      "passed"        — desired transition occurred; arm is halted in place.
+      "max_reached"   — arm reached `arm_pos_target` without the transition.
+      "stopped"       — stop_event fired; arm halted.
+      "timeout"       — `time_budget_s` expired; arm halted.
+    """
+    assert wait_for in ("reveal_after_occlusion", "occlusion"), wait_for
+
+    with _lock_ctx(robot_lock):
+        start_pos = _read_arm_pos(robot)
+        _safe_call("arm.move_to(scan)",
+                   lambda: robot.arm.move_to(arm_pos_target, scan_v, scan_a))
+        _safe_call("push_command(scan)", robot.push_command)
+
+    state = "INITIAL_VISIBLE" if wait_for == "reveal_after_occlusion" else "WAIT_OCCLUDE"
+    consecutive_lost = 0
+    consecutive_visible = 0
+
+    direction = 1 if arm_pos_target > start_pos else -1
+    deadline = time.time() + time_budget_s
+
+    logger.info(
+        "scan: %s arm %.2f -> %.2f (v=%.2f) state=%s",
+        wait_for, start_pos, arm_pos_target, scan_v, state,
+    )
+
+    while not stop_event.is_set():
+        if time.time() > deadline:
+            _halt_arm(robot, robot_lock, halt_v, halt_a)
+            logger.warning("scan: timed out after %.1fs in state %s", time_budget_s, state)
+            return "timeout"
+
+        color, _depth = cam.get_frames()
+        if color is None:
+            time.sleep(poll_period_s)
+            continue
+
+        with _lock_ctx(robot_lock):
+            real_pan, real_tilt = read_head_pose(robot)
+            arm_pos = _read_arm_pos(robot)
+
+        detections = detector.detect(color)
+        if on_pose is not None:
+            try:
+                on_pose(color, detections, real_pan, real_tilt)
+            except Exception as exc:
+                logger.warning("on_pose callback raised: %s", exc)
+
+        target_seen = pick_target(detections, target_conf_min) is not None
+
+        if state == "INITIAL_VISIBLE":
+            if not target_seen:
+                consecutive_lost += 1
+                if consecutive_lost >= transition_threshold:
+                    logger.info("scan: occluded at arm=%.3f — waiting for reveal", arm_pos)
+                    state = "WAIT_REVEAL"
+                    consecutive_lost = 0
+            else:
+                consecutive_lost = 0
+        elif state == "WAIT_REVEAL":
+            if target_seen:
+                consecutive_visible += 1
+                if consecutive_visible >= transition_threshold:
+                    _halt_arm(robot, robot_lock, halt_v, halt_a)
+                    logger.info("scan: revealed at arm=%.3f", arm_pos)
+                    return "passed"
+            else:
+                consecutive_visible = 0
+        elif state == "WAIT_OCCLUDE":
+            if not target_seen:
+                consecutive_lost += 1
+                if consecutive_lost >= transition_threshold:
+                    _halt_arm(robot, robot_lock, halt_v, halt_a)
+                    logger.info("scan: occluded at arm=%.3f", arm_pos)
+                    return "passed"
+            else:
+                consecutive_lost = 0
+
+        # Detect "we've reached the move-to target" — direction-aware so we
+        # don't false-trigger when the arm overshoots a tiny bit then comes back.
+        if direction > 0 and arm_pos >= arm_pos_target - arrival_tol_m:
+            logger.info("scan: reached target arm=%.3f without transition (state=%s)", arm_pos, state)
+            return "max_reached"
+        if direction < 0 and arm_pos <= arm_pos_target + arrival_tol_m:
+            logger.info("scan: reached target arm=%.3f without transition (state=%s)", arm_pos, state)
+            return "max_reached"
+
+        time.sleep(poll_period_s)
+
+    _halt_arm(robot, robot_lock, halt_v, halt_a)
+    return "stopped"
+
+
 def hover_above_target(
     robot,
     cam: CameraManager,
@@ -932,32 +1072,65 @@ def hover_above_target(
     on_pose: PoseCallback = None,
     robot_lock: Optional[threading.Lock] = None,
 ) -> str:
-    """Position the gripper to hover above the currently-locked fruit.
+    """Visual-servo hover: extend until the fruit is revealed past the
+    gripper, then retract until it is occluded again.
 
     Caller is expected to have stopped the active track loop first so the
-    head is held at the lock-on pose. Steps:
-      1. Drain a few stable frames and read the (frozen) head pose.
-      2. Run the detector once with the existing target lock.
-      3. Deproject the target's pixel center to the robot base frame
-         using `cam.pixel_to_robot_frame`.
-      4. Decide reach branch (right side / wrong side) via ArmController.
-      5. Move wrist/gripper, then lift, then arm extension under
-         `robot_lock`, with `wait_command` between stepper moves so the
-         lift fully clears before the arm extends laterally.
+    head is held at the lock-on pose. The fruit's lateral position is
+    determined visually by the gripper sweeping through the camera-to-fruit
+    line of sight (rather than by deprojected depth) — much more accurate
+    in the presence of detector/depth noise.
 
-    Returns one of "hovered", "no_target", "no_depth", "stopped", "error".
-    The head is never commanded by this function — it stays where track
-    left it.
+    Steps:
+      1. Sample a single 3D position to pick the lift height (z + clearance)
+         and to detect the wrong-side case.
+      2. Wrong-side: run the existing position_above_unreachable fallback.
+      3. Right-side:
+         a. Pose the wrist outward (yaw=0, pitch=0, roll=0), gripper open.
+         b. Move the lift to clearance height (blocking).
+         c. Phase A: extend the arm slowly toward max_extension. Watch the
+            detector: wait for the fruit to disappear (occluded), then for
+            it to reappear (gripper passed it). Halt.
+         d. Phase B: retract the arm slowly toward 0. Watch the detector:
+            stop the moment the fruit becomes occluded again — that point
+            is the precise hover target.
+
+    Returns one of:
+      "hovered"          — full extend+retract cycle completed.
+      "no_target"        — no detection at the lock-on pose.
+      "no_depth"         — invalid depth at the target pixel.
+      "extend_no_pass"   — arm reached max_extension without the fruit being
+                           passed; arm retracted to 0 before returning.
+      "retract_no_cover" — arm got back to 0 without re-occluding the fruit.
+      "stopped"          — stop_event fired mid-sequence.
+      "error"            — frames unavailable.
+
+    The head is never commanded by this function.
     """
     arm_kbd = config.get("arm_keyboard", {}) or {}
     lift_v = float(arm_kbd.get("lift_v_m_s", 0.5))
     lift_a = float(arm_kbd.get("lift_a_m_s2", 0.4))
-    arm_v = float(arm_kbd.get("arm_v_m_s", 0.5))
-    arm_a = float(arm_kbd.get("arm_a_m_s2", 0.4))
+    arm_v_halt = float(arm_kbd.get("arm_v_m_s", 0.5))
+    arm_a_halt = float(arm_kbd.get("arm_a_m_s2", 0.4))
     wrist_v = float(arm_kbd.get("wrist_v_rad_s", 2.0))
     wrist_a = float(arm_kbd.get("wrist_a_rad_s2", 4.0))
     grip_v = float(arm_kbd.get("gripper_v", 5.0))
     grip_a = float(arm_kbd.get("gripper_a", 10.0))
+
+    arm_cfg = config.get("arm", {}) or {}
+    max_extension = float(arm_cfg.get("max_extension_m", 0.5))
+    height_above = float(arm_cfg.get("height_above_object_m", 0.15))
+    min_lift = float(arm_cfg.get("min_lift_m", 0.05))
+    max_lift = float(arm_cfg.get("max_lift_m", 1.05))
+
+    trk_cfg = config.get("tracking", {}) or {}
+    target_conf_min = float(trk_cfg.get("target_conf_min", 0.25))
+
+    # Slow scan envelope so the detector at ~5 Hz has multiple frames per
+    # cm of arm motion. Hard-coded here (not in config) to keep the visual
+    # servo predictable; promote to config if we want to tune later.
+    scan_v = 0.05
+    scan_a = 0.2
 
     if stop_event.is_set():
         return "stopped"
@@ -994,39 +1167,52 @@ def hover_above_target(
         x_fwd, y_left, z_up, real_pan, real_tilt, target.confidence,
     )
 
-    if y_left <= -0.05:
-        commands = arm_controller.position_above(target_3d)
-    else:
+    # Wrong-side fallback: arm only extends right; if the fruit is on the
+    # left there's nothing to scan toward. Use the existing pose helper.
+    if y_left > -0.05:
         logger.info(
             "hover: fruit not on the right (y_left=%+.2f); retracting arm and lifting to clearance",
             y_left,
         )
         commands = arm_controller.position_above_unreachable(z_up)
+        cmd_by_joint = {c.joint: c.value for c in commands}
+        lift_target_unreachable = float(cmd_by_joint.get("lift", 0.6))
+        with _lock_ctx(robot_lock):
+            _safe_call("wrist_yaw",
+                       lambda: robot.end_of_arm.move_to("wrist_yaw", 0.0, wrist_v, wrist_a))
+            _safe_call("wrist_pitch",
+                       lambda: robot.end_of_arm.move_to("wrist_pitch", 0.0, wrist_v, wrist_a))
+            _safe_call("wrist_roll",
+                       lambda: robot.end_of_arm.move_to("wrist_roll", 0.0, wrist_v, wrist_a))
+            _safe_call("gripper.open",
+                       lambda: robot.end_of_arm.move_to("stretch_gripper", 50.0, grip_v, grip_a))
+            _safe_call("arm.retract",
+                       lambda: robot.arm.move_to(0.0, arm_v_halt, arm_a_halt))
+            _safe_call("push_command", robot.push_command)
+            _safe_call("wait_command", robot.wait_command)
+            _safe_call("lift.move_to",
+                       lambda: robot.lift.move_to(lift_target_unreachable, lift_v, lift_a))
+            _safe_call("push_command(lift)", robot.push_command)
+            _safe_call("wait_command(lift)", robot.wait_command)
+        return "hovered"
 
-    cmd_by_joint = {c.joint: c.value for c in commands}
-    lift_target = float(cmd_by_joint.get("lift", 0.6))
-    arm_target = float(cmd_by_joint.get("arm", 0.0))
-    wrist_yaw = float(cmd_by_joint.get("wrist_yaw", 0.0))
-    wrist_pitch = float(cmd_by_joint.get("wrist_pitch", -1.57))
-    wrist_roll = float(cmd_by_joint.get("wrist_roll", 0.0))
-    grip_pct = float(cmd_by_joint.get("gripper", 50.0))
+    # Right-side: visual servo path.
+    lift_target = clamp(z_up + height_above, min_lift, max_lift)
 
-    # Phase 1: orient wrist + open gripper. These are non-blocking
-    # Dynamixel commands that can run concurrently with the lift.
+    # 1. Pose wrist outward + open gripper (non-blocking Dynamixels).
     if stop_event.is_set():
         return "stopped"
     with _lock_ctx(robot_lock):
         _safe_call("wrist_yaw",
-                   lambda: robot.end_of_arm.move_to("wrist_yaw", wrist_yaw, wrist_v, wrist_a))
+                   lambda: robot.end_of_arm.move_to("wrist_yaw", 0.0, wrist_v, wrist_a))
         _safe_call("wrist_pitch",
-                   lambda: robot.end_of_arm.move_to("wrist_pitch", wrist_pitch, wrist_v, wrist_a))
+                   lambda: robot.end_of_arm.move_to("wrist_pitch", 0.0, wrist_v, wrist_a))
         _safe_call("wrist_roll",
-                   lambda: robot.end_of_arm.move_to("wrist_roll", wrist_roll, wrist_v, wrist_a))
+                   lambda: robot.end_of_arm.move_to("wrist_roll", 0.0, wrist_v, wrist_a))
         _safe_call("gripper.open",
-                   lambda: robot.end_of_arm.move_to("stretch_gripper", grip_pct, grip_v, grip_a))
+                   lambda: robot.end_of_arm.move_to("stretch_gripper", 50.0, grip_v, grip_a))
 
-    # Phase 2: lift to clearance height first so the gripper clears any
-    # surface before the arm extends laterally.
+    # 2. Lift to clearance height first; block so the arm scan happens at the right z.
     if stop_event.is_set():
         return "stopped"
     with _lock_ctx(robot_lock):
@@ -1035,34 +1221,57 @@ def hover_above_target(
         _safe_call("push_command(lift)", robot.push_command)
         _safe_call("wait_command(lift)", robot.wait_command)
 
-    # Phase 3: extend the arm laterally to the target distance.
     if stop_event.is_set():
         return "stopped"
-    with _lock_ctx(robot_lock):
-        _safe_call("arm.move_to",
-                   lambda: robot.arm.move_to(arm_target, arm_v, arm_a))
-        _safe_call("push_command(arm)", robot.push_command)
-        _safe_call("wait_command(arm)", robot.wait_command)
 
-    # Phase 4: re-affirm gripper open in case it drifted during stepper moves.
-    with _lock_ctx(robot_lock):
-        _safe_call("gripper.reaffirm",
-                   lambda: robot.end_of_arm.move_to("stretch_gripper", grip_pct, grip_v, grip_a))
-
-    # One last frame so the GUI preview reflects the post-hover view.
-    color2, _depth2 = cam.get_frames()
-    if color2 is not None and on_pose is not None:
-        with _lock_ctx(robot_lock):
-            real_pan2, real_tilt2 = read_head_pose(robot)
-        try:
-            on_pose(color2, [], real_pan2, real_tilt2)
-        except Exception as exc:
-            logger.warning("on_pose callback raised: %s", exc)
-
-    logger.info(
-        "hover: complete (lift=%.2f arm=%.2f wrist_pitch=%.2f gripper=%.0f)",
-        lift_target, arm_target, wrist_pitch, grip_pct,
+    # 3. Phase A — extend until the fruit reappears past the gripper.
+    logger.info("hover: phase A — extending to find reveal-after-occlusion")
+    extend_result = _scan_arm_for_visibility(
+        robot, cam, detector,
+        arm_pos_target=max_extension,
+        scan_v=scan_v, scan_a=scan_a,
+        halt_v=arm_v_halt, halt_a=arm_a_halt,
+        target_conf_min=target_conf_min,
+        wait_for="reveal_after_occlusion",
+        stop_event=stop_event,
+        on_pose=on_pose,
+        robot_lock=robot_lock,
     )
+    if extend_result == "stopped":
+        return "stopped"
+    if extend_result != "passed":
+        logger.warning("hover: extend phase ended as %r — retracting", extend_result)
+        with _lock_ctx(robot_lock):
+            _safe_call("arm.retract",
+                       lambda: robot.arm.move_to(0.0, arm_v_halt, arm_a_halt))
+            _safe_call("push_command", robot.push_command)
+            _safe_call("wait_command", robot.wait_command)
+        return "extend_no_pass"
+
+    if stop_event.is_set():
+        return "stopped"
+
+    # 4. Phase B — retract until the fruit becomes occluded again.
+    logger.info("hover: phase B — retracting to find first occlusion")
+    retract_result = _scan_arm_for_visibility(
+        robot, cam, detector,
+        arm_pos_target=0.0,
+        scan_v=scan_v, scan_a=scan_a,
+        halt_v=arm_v_halt, halt_a=arm_a_halt,
+        target_conf_min=target_conf_min,
+        wait_for="occlusion",
+        stop_event=stop_event,
+        on_pose=on_pose,
+        robot_lock=robot_lock,
+    )
+    if retract_result == "stopped":
+        return "stopped"
+    if retract_result != "passed":
+        logger.warning("hover: retract phase ended as %r", retract_result)
+        return "retract_no_cover"
+
+    final_arm = _read_arm_pos(robot)
+    logger.info("hover: complete (lift=%.2f arm=%.3f, gripper-occlusion locked)", lift_target, final_arm)
     return "hovered"
 
 
