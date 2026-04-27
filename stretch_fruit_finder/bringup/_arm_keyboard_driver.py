@@ -2,6 +2,14 @@
 Keyboard driver for Stretch arm / lift / wrist / gripper teleop inside
 the L4 GUI. Pairs with `_keyboard_driver.py` (which handles the base).
 
+Layering note: this module is the *teleop input + hardware dispatch*
+layer. It deliberately does NOT replace
+`stretch_fruit_finder.fruit_finder.arm_controller.ArmController`, which
+is the *pose-math* layer that returns `MotorCommand` lists for things
+like "position the gripper above this 3D point" or "stow". That math
+layer is queued for use by L5b (the auto-position-arm-above-detected-
+orange button); the two layers will compose, not duplicate.
+
 Earlier versions issued one `move_by(small_delta)` per tick at 30 Hz,
 which caused the stepper firmware to ramp up-and-down inside every 33 ms
 chunk -- visible as staggered motion. This rewrite uses the API stretch
