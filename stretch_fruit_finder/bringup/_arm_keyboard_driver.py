@@ -58,6 +58,7 @@ from __future__ import annotations
 
 import logging
 import threading
+import time
 import tkinter as tk
 from typing import Dict, Optional, Set
 
@@ -236,13 +237,16 @@ class ArmKeyboardDriver:
     Holds a set of currently-pressed keysyms plus a one-shot flag for
     "stow requested". `apply_tick(robot, robot_lock)` is called each
     tick by the ArmExecutor thread.
-    """
 
-    # Autorepeat fake-release suppression — see _keyboard_driver.py for the
-    # full rationale. Two complementary checks: X11 timestamp equality
-    # between an autorepeat KeyRelease and the following KeyPress (primary),
-    # and a deferred timer as a fallback when GUI load skews event timing.
-    _AUTOREPEAT_DEBOUNCE_MS = 120
+    Edge-triggered model (since the held-state debounce was prone to
+    "stuck" motion under GUI load): each KeyPress event queues one
+    motion chunk on the relevant axis. KeyRelease is ignored entirely.
+    Holding a key works because X11 autorepeat fires KeyPress events at
+    the OS rate, each enqueueing another chunk; releasing the key
+    simply stops the events, and the arm halts within one tick because
+    there's no held-state to fail to clear. Tapping is the natural
+    primitive — holding is just rapid tapping.
+    """
 
     def __init__(self, root: tk.Misc, config: Optional[dict] = None):
         self._root = root
@@ -251,21 +255,27 @@ class ArmKeyboardDriver:
         arm_cfg = (config or {}).get("arm_keyboard", {}) or {}
         self._p: Dict[str, Optional[float]] = {**DEFAULTS, **arm_cfg}
 
-        self._pressed: Set[str] = set()
-        self._pending_releases: Dict[str, str] = {}  # keysym -> after-id
-        self._last_press_time: Dict[str, int] = {}   # keysym -> X11 server time of last KeyPress
+        # Pending motion chunks accumulated between ticks. axis -> signed
+        # delta in the joint's native units. Drained by apply_tick.
+        self._pending: Dict[str, float] = {}
+        # Recency-based snapshot for the GUI status line. Each KeyPress
+        # refreshes the timestamp; pressed_snapshot returns keys that
+        # received a press within the last `_PRESSED_RECENCY_S` seconds
+        # (autorepeat keeps a held key in the snapshot).
+        self._last_press_monotonic: Dict[str, float] = {}
         self._stow_requested = False
         self._lock = threading.Lock()
 
+        # Only KeyPress is bound; KeyRelease has no semantic role in this
+        # model. Autorepeat is treated as a feature, not a bug.
         root.bind_all("<KeyPress>", self._on_press, add="+")
-        root.bind_all("<KeyRelease>", self._on_release, add="+")
 
         ct_lift = self._p.get("lift_contact_thresh_pos_N")
         ct_arm = self._p.get("arm_contact_thresh_pos_N")
         logger.info(
-            "ArmKeyboardDriver: lift=%.3f m/tick (v=%.2f a=%.2f)  "
-            "arm=%.3f m/tick (v=%.2f a=%.2f)  wrist=%.3f rad/tick  "
-            "gripper=%.1f pct/tick  contact: lift=%s arm=%s",
+            "ArmKeyboardDriver(edge-triggered): lift=%.3f m/press (v=%.2f a=%.2f)  "
+            "arm=%.3f m/press (v=%.2f a=%.2f)  wrist=%.3f rad/press  "
+            "gripper=%.1f pct/press  contact: lift=%s arm=%s",
             self._p["lift_m_per_tick"], self._p["lift_v_m_s"], self._p["lift_a_m_s2"],
             self._p["arm_m_per_tick"], self._p["arm_v_m_s"], self._p["arm_a_m_s2"],
             self._p["wrist_rad_per_tick"], self._p["gripper_pct_per_tick"],
@@ -275,74 +285,67 @@ class ArmKeyboardDriver:
 
     # ------------------------------------------------------------------
 
-    def _is_mapped(self, sym: str) -> bool:
-        return (
-            sym in _LIFT_UP or sym in _LIFT_DOWN
-            or sym in _ARM_RETRACT or sym in _ARM_EXTEND
-            or sym in _WRIST_YAW_POS or sym in _WRIST_YAW_NEG
-            or sym in _WRIST_PITCH_POS or sym in _WRIST_PITCH_NEG
-            or sym in _WRIST_ROLL_POS or sym in _WRIST_ROLL_NEG
-            or sym in _GRIPPER_CLOSE or sym in _GRIPPER_OPEN
-            or sym in _STOW_KEYS
-        )
+    def _key_to_chunk(self, sym: str) -> Optional[tuple]:
+        """Map a keysym to (axis_name, signed_delta_per_press). None if unmapped."""
+        p = self._p
+        if sym in _LIFT_UP:
+            return ("lift", float(p["lift_m_per_tick"]))
+        if sym in _LIFT_DOWN:
+            return ("lift", -float(p["lift_m_per_tick"]))
+        if sym in _ARM_EXTEND:
+            return ("arm", float(p["arm_m_per_tick"]))
+        if sym in _ARM_RETRACT:
+            return ("arm", -float(p["arm_m_per_tick"]))
+        if sym in _WRIST_YAW_POS:
+            return ("wrist_yaw", float(p["wrist_rad_per_tick"]))
+        if sym in _WRIST_YAW_NEG:
+            return ("wrist_yaw", -float(p["wrist_rad_per_tick"]))
+        if sym in _WRIST_PITCH_POS:
+            return ("wrist_pitch", float(p["wrist_rad_per_tick"]))
+        if sym in _WRIST_PITCH_NEG:
+            return ("wrist_pitch", -float(p["wrist_rad_per_tick"]))
+        if sym in _WRIST_ROLL_POS:
+            return ("wrist_roll", float(p["wrist_rad_per_tick"]))
+        if sym in _WRIST_ROLL_NEG:
+            return ("wrist_roll", -float(p["wrist_rad_per_tick"]))
+        if sym in _GRIPPER_OPEN:
+            return ("gripper", float(p["gripper_pct_per_tick"]))
+        if sym in _GRIPPER_CLOSE:
+            return ("gripper", -float(p["gripper_pct_per_tick"]))
+        return None
 
     def _on_press(self, event) -> None:
         sym = event.keysym
-        if not self._is_mapped(sym):
-            return
-        # Stow is edge-triggered, not held — short-circuit before recording
-        # press time / cancelling deferred releases.
         if sym in _STOW_KEYS:
             with self._lock:
                 self._stow_requested = True
+                self._last_press_monotonic[sym] = time.monotonic()
             return
-        self._last_press_time[sym] = int(getattr(event, "time", 0))
-        # Cancel any in-flight deferred release for this key.
-        pending = self._pending_releases.pop(sym, None)
-        if pending is not None:
-            try:
-                self._root.after_cancel(pending)
-            except Exception:
-                pass
+        chunk = self._key_to_chunk(sym)
+        if chunk is None:
+            return
+        axis, delta = chunk
         with self._lock:
-            self._pressed.add(sym)
-
-    def _on_release(self, event) -> None:
-        sym = event.keysym
-        if not self._is_mapped(sym):
-            return
-        if sym in _STOW_KEYS:
-            return
-        release_time = int(getattr(event, "time", 0))
-        # Check 1: identical X11 timestamps mean autorepeat fake.
-        last_press = self._last_press_time.get(sym)
-        if last_press is not None and release_time and last_press == release_time:
-            return
-        # Check 2 (fallback): defer the discard. KeyPress within the window cancels.
-        existing = self._pending_releases.pop(sym, None)
-        if existing is not None:
-            try:
-                self._root.after_cancel(existing)
-            except Exception:
-                pass
-        self._pending_releases[sym] = self._root.after(
-            self._AUTOREPEAT_DEBOUNCE_MS,
-            lambda s=sym, t=release_time: self._real_release(s, t),
-        )
-
-    def _real_release(self, sym: str, release_time: int) -> None:
-        self._pending_releases.pop(sym, None)
-        last_press = self._last_press_time.get(sym)
-        if last_press is not None and release_time and last_press > release_time:
-            return
-        with self._lock:
-            self._pressed.discard(sym)
+            self._pending[axis] = self._pending.get(axis, 0.0) + delta
+            self._last_press_monotonic[sym] = time.monotonic()
 
     # ------------------------------------------------------------------
 
+    # Window for "is this key being actively pressed?" status display.
+    # Slightly longer than X11's typical autorepeat period so a held key
+    # stays in the snapshot reliably.
+    _PRESSED_RECENCY_S = 0.15
+
     def pressed_snapshot(self) -> Set[str]:
+        """Return keysyms with a KeyPress in the last `_PRESSED_RECENCY_S`.
+
+        Recency-based, not held-state — autorepeat refreshes the
+        timestamp so a held key stays in the snapshot. For UI status
+        display only; motion is not gated by this.
+        """
+        cutoff = time.monotonic() - self._PRESSED_RECENCY_S
         with self._lock:
-            return set(self._pressed)
+            return {sym for sym, t in self._last_press_monotonic.items() if t >= cutoff}
 
     def take_stow_request(self) -> bool:
         """Return True if stow was requested since last call, then reset."""
@@ -352,41 +355,36 @@ class ArmKeyboardDriver:
             return out
 
     def is_active(self) -> bool:
+        """True if any motion chunks are queued or stow is pending."""
         with self._lock:
-            return bool(self._pressed) or self._stow_requested
+            return bool(self._pending) or self._stow_requested
 
     # ------------------------------------------------------------------
 
     def apply_tick(self, robot, robot_lock: Optional[threading.Lock]) -> None:
         """
-        Apply one tick of motion based on currently-held keys.
+        Apply one tick of motion by draining the pending-chunk dict.
 
-        Caller is responsible for rate (ArmExecutor calls at 30 Hz).
-        Robot method calls happen under `robot_lock` if provided.
+        Each KeyPress (real or autorepeat) since the last tick contributed
+        a signed delta to the relevant axis; this method emits one move_by
+        per non-zero axis. Opposite-direction presses cancel naturally.
+        Releasing a key just stops new chunks from arriving — there's no
+        held-state to clear, so the arm cannot get "stuck" if a release
+        event is dropped.
         """
         # Hardware-runstop sanity. If active, do nothing this tick — no
         # move_by, no push_command. Resume on release.
         if _is_runstopped(robot):
             return
 
-        pressed = self.pressed_snapshot()
-        if not pressed:
-            return  # nothing held, nothing to do
+        with self._lock:
+            chunks = self._pending
+            self._pending = {}
+
+        if not chunks:
+            return
 
         p = self._p
-
-        # Resolve axis intentions: +1, -1, or 0.
-        lift_dir = (1 if pressed & _LIFT_UP else 0) - (1 if pressed & _LIFT_DOWN else 0)
-        arm_dir = (1 if pressed & _ARM_EXTEND else 0) - (1 if pressed & _ARM_RETRACT else 0)
-        yaw_dir = (1 if pressed & _WRIST_YAW_POS else 0) - (1 if pressed & _WRIST_YAW_NEG else 0)
-        pitch_dir = (1 if pressed & _WRIST_PITCH_POS else 0) - (1 if pressed & _WRIST_PITCH_NEG else 0)
-        roll_dir = (1 if pressed & _WRIST_ROLL_POS else 0) - (1 if pressed & _WRIST_ROLL_NEG else 0)
-        grip_dir = (1 if pressed & _GRIPPER_OPEN else 0) - (1 if pressed & _GRIPPER_CLOSE else 0)
-
-        # Skip lock entirely if every axis is idle (e.g. only stow key
-        # was held — already consumed by the executor before this call).
-        if not any((lift_dir, arm_dir, yaw_dir, pitch_dir, roll_dir, grip_dir)):
-            return
 
         def _safe(fn_name: str, fn):
             try:
@@ -394,13 +392,22 @@ class ArmKeyboardDriver:
             except Exception as exc:
                 logger.warning("arm keyboard: %s failed: %s", fn_name, exc)
 
+        eps = 1e-6
+
         def _do_work():
             push_needed = False
 
+            lift_d = chunks.get("lift", 0.0)
+            arm_d = chunks.get("arm", 0.0)
+            yaw_d = chunks.get("wrist_yaw", 0.0)
+            pitch_d = chunks.get("wrist_pitch", 0.0)
+            roll_d = chunks.get("wrist_roll", 0.0)
+            grip_d = chunks.get("gripper", 0.0)
+
             # Stepper joints (lift + arm) -- need push_command at end.
-            if lift_dir != 0:
+            if abs(lift_d) > eps:
                 _safe("lift.move_by", lambda: robot.lift.move_by(
-                    lift_dir * p["lift_m_per_tick"],
+                    lift_d,
                     p["lift_v_m_s"],
                     p["lift_a_m_s2"],
                     **_kw_thresholds(p, "lift_contact_thresh_pos_N",
@@ -408,9 +415,9 @@ class ArmKeyboardDriver:
                 ))
                 push_needed = True
 
-            if arm_dir != 0:
+            if abs(arm_d) > eps:
                 _safe("arm.move_by", lambda: robot.arm.move_by(
-                    arm_dir * p["arm_m_per_tick"],
+                    arm_d,
                     p["arm_v_m_s"],
                     p["arm_a_m_s2"],
                     **_kw_thresholds(p, "arm_contact_thresh_pos_N",
@@ -419,33 +426,21 @@ class ArmKeyboardDriver:
                 push_needed = True
 
             # Dynamixel joints (wrist + gripper) -- no push needed.
-            if yaw_dir != 0:
+            if abs(yaw_d) > eps:
                 _safe("wrist_yaw.move_by", lambda: robot.end_of_arm.move_by(
-                    "wrist_yaw",
-                    yaw_dir * p["wrist_rad_per_tick"],
-                    p["wrist_v_rad_s"],
-                    p["wrist_a_rad_s2"],
+                    "wrist_yaw", yaw_d, p["wrist_v_rad_s"], p["wrist_a_rad_s2"],
                 ))
-            if pitch_dir != 0:
+            if abs(pitch_d) > eps:
                 _safe("wrist_pitch.move_by", lambda: robot.end_of_arm.move_by(
-                    "wrist_pitch",
-                    pitch_dir * p["wrist_rad_per_tick"],
-                    p["wrist_v_rad_s"],
-                    p["wrist_a_rad_s2"],
+                    "wrist_pitch", pitch_d, p["wrist_v_rad_s"], p["wrist_a_rad_s2"],
                 ))
-            if roll_dir != 0:
+            if abs(roll_d) > eps:
                 _safe("wrist_roll.move_by", lambda: robot.end_of_arm.move_by(
-                    "wrist_roll",
-                    roll_dir * p["wrist_rad_per_tick"],
-                    p["wrist_v_rad_s"],
-                    p["wrist_a_rad_s2"],
+                    "wrist_roll", roll_d, p["wrist_v_rad_s"], p["wrist_a_rad_s2"],
                 ))
-            if grip_dir != 0:
+            if abs(grip_d) > eps:
                 _safe("gripper.move_by", lambda: robot.end_of_arm.move_by(
-                    "stretch_gripper",
-                    grip_dir * p["gripper_pct_per_tick"],
-                    p["gripper_v"],
-                    p["gripper_a"],
+                    "stretch_gripper", grip_d, p["gripper_v"], p["gripper_a"],
                 ))
 
             if push_needed:
