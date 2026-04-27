@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=Chef Fruit Finder
+GenericName=Stretch RE2 Fruit Finder GUI
+Comment=Search for, track, and hover above a fruit on the Stretch RE2 robot
+Exec=@LAUNCHER_PATH@
+Icon=@ICON_PATH@
+Terminal=true
+Categories=Utility;Development;Education;
+Keywords=stretch;robot;fruit;hello-robot;
+StartupNotify=true
