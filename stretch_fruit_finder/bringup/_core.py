@@ -285,22 +285,76 @@ def _resolve_tilt_rows(nav: dict, limits: HeadLimits) -> list[float]:
     return seen or [clamp(-0.6, limits.tilt_lo, limits.tilt_hi)]
 
 
-def _move_head_joint(robot, joint: str, x_des: float, v_des: Optional[float], a_des: Optional[float]) -> None:
-    """robot.head.move_to() with a velocity/accel cap, falling back if the SDK rejects the kwargs.
+_HEAD_SPEED_API_LOGGED: dict[str, bool] = {}
 
-    Stretch's head Dynamixels move at the joint's default profile velocity
-    (~3 rad/s for head_pan) when no v_des is given — way too fast for the
-    detector to find anything in flight. Pass v_des to actually slow it
-    down. If a particular SDK build doesn't accept the kwargs, fall back
-    to the plain call so we don't break older firmware.
+
+def _move_head_joint(robot, joint_name: str, x_des: float, v_des: Optional[float], a_des: Optional[float]) -> None:
+    """Move a head joint at a capped speed/accel.
+
+    Stretch's head Dynamixels run at the joint's default profile velocity
+    (~3 rad/s for head_pan) unless a slower one is explicitly applied.
+    `robot.head.move_to(name, x)` is a thin wrapper that does NOT forward
+    speed caps in every stretch_body version, so we go straight to the
+    joint object — which uniformly supports `move_to(x, v_des=, a_des=)`
+    on DynamixelHelloXL430 — and only fall back to setting the profile
+    velocity registers separately if even that signature is missing.
+
+    A loud warning is logged the first time we have to fall back so
+    runaway speed isn't silently masked again.
     """
+    if v_des is None and a_des is None:
+        robot.head.move_to(joint_name, x_des)
+        return
+
     try:
-        if v_des is not None or a_des is not None:
-            robot.head.move_to(joint, x_des, v_des=v_des, a_des=a_des)
-            return
+        joint = robot.head.get_joint(joint_name)
+    except Exception as exc:
+        logger.warning("get_joint(%r) failed (%s); using head.move_to without speed cap", joint_name, exc)
+        robot.head.move_to(joint_name, x_des)
+        return
+
+    # Preferred: joint-level move_to with kwargs (most stretch_body versions).
+    try:
+        joint.move_to(x_des, v_des=v_des, a_des=a_des)
+        if not _HEAD_SPEED_API_LOGGED.get("kwargs"):
+            _HEAD_SPEED_API_LOGGED["kwargs"] = True
+            logger.info("head speed cap applied via joint.move_to(v_des=, a_des=)")
+        return
     except TypeError:
         pass
-    robot.head.move_to(joint, x_des)
+    except Exception as exc:
+        logger.warning("joint.move_to(v_des) failed unexpectedly (%s); trying profile-register fallback", exc)
+
+    # Fallback: write the dynamixel profile velocity/accel registers, then move.
+    applied_any = False
+    for attr, value in (
+        ("set_motion_profile_velocity", v_des),
+        ("set_motion_profile_acceleration", a_des),
+    ):
+        if value is None:
+            continue
+        fn = getattr(joint, attr, None)
+        if fn is None:
+            continue
+        try:
+            fn(value)
+            applied_any = True
+        except Exception as exc:
+            logger.warning("joint.%s(%.2f) failed (%s)", attr, value, exc)
+    try:
+        joint.move_to(x_des)
+        if applied_any and not _HEAD_SPEED_API_LOGGED.get("profile"):
+            _HEAD_SPEED_API_LOGGED["profile"] = True
+            logger.info("head speed cap applied via set_motion_profile_velocity/acceleration")
+        elif not applied_any and not _HEAD_SPEED_API_LOGGED.get("none"):
+            _HEAD_SPEED_API_LOGGED["none"] = True
+            logger.warning(
+                "no head speed-cap API available on this stretch_body build; "
+                "head will run at default profile velocity"
+            )
+    except Exception as exc:
+        logger.warning("joint.move_to(x) fallback failed (%s); using head.move_to", exc)
+        robot.head.move_to(joint_name, x_des)
 
 
 def _slew_and_detect(
