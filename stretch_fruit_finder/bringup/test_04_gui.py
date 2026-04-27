@@ -413,7 +413,9 @@ class FruitFinderGUI:
 
         self.canvas = tk.Canvas(left, width=640, height=480, bg="black", highlightthickness=0)
         self.canvas.grid(row=0, column=0, sticky="nsew")
-        self.canvas_image_id = self.canvas.create_image(0, 0, anchor="nw")
+        # Anchor "center" so the rendered frame stays centred when the
+        # canvas is bigger than the camera image's aspect ratio.
+        self.canvas_image_id = self.canvas.create_image(320, 240, anchor="center")
         self.canvas.create_text(
             320, 240,
             text="Waiting for camera...",
@@ -788,7 +790,23 @@ class FruitFinderGUI:
 
         rgb = cv2.cvtColor(overlay, cv2.COLOR_BGR2RGB)
         img = Image.fromarray(rgb)
+
+        # Resize to fit the canvas's current size, preserving aspect
+        # ratio. winfo_width/height return 1 before the first layout pass
+        # — fall back to the canvas's reqwidth/reqheight (640x480) then.
+        cw = self.canvas.winfo_width()
+        ch = self.canvas.winfo_height()
+        if cw < 2 or ch < 2:
+            cw, ch = self.canvas.winfo_reqwidth(), self.canvas.winfo_reqheight()
+        scale = min(cw / img.width, ch / img.height)
+        new_w = max(1, int(img.width * scale))
+        new_h = max(1, int(img.height * scale))
+        if (new_w, new_h) != (img.width, img.height):
+            img = img.resize((new_w, new_h), Image.Resampling.LANCZOS)
+
         self._current_photo = ImageTk.PhotoImage(img)
+        # Keep the image centred as the window resizes.
+        self.canvas.coords(self.canvas_image_id, cw // 2, ch // 2)
         self.canvas.itemconfig(self.canvas_image_id, image=self._current_photo)
         self.canvas.delete("placeholder")
 
