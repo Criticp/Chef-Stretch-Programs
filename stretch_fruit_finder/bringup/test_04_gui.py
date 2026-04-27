@@ -123,6 +123,9 @@ class Worker(threading.Thread):
         self.shutdown_event = shutdown_event
         self.robot_lock = robot_lock
         self._stop_current = threading.Event()  # stops the current sweep/track loop
+        # Stateless math for the "Hover above target" button.
+        from fruit_finder.arm_controller import ArmController  # local to avoid a top-of-module cycle
+        self.arm_controller = ArmController(config)
 
     def stop_current(self) -> None:
         self._stop_current.set()
@@ -239,6 +242,68 @@ class Worker(threading.Thread):
                 self.event_q.put(("log", f"Track ended: {reason}"))
                 self._publish_state("IDLE")
                 _core.center_head(self.robot, robot_lock=self.robot_lock)
+
+            if cmd[0] == "hover":
+                # Stop any active track loop so the head freezes at its
+                # current lock-on pose. Brief sleep lets the in-flight
+                # iteration of track() observe the stop_event and return.
+                self._stop_current.set()
+                time.sleep(0.1)
+                self._stop_current.clear()
+                self._publish_state("HOVERING")
+
+                try:
+                    result = _core.hover_above_target(
+                        self.robot, self.cam, self.detector, self.config,
+                        self._stop_current,
+                        arm_controller=self.arm_controller,
+                        on_pose=self._make_on_pose(),
+                        robot_lock=self.robot_lock,
+                    )
+                except Exception as exc:
+                    self.event_q.put(("log", f"ERROR during hover: {exc}"))
+                    self._publish_state("IDLE")
+                    continue
+
+                self.event_q.put(("log", f"Hover result: {result}"))
+
+                if result != "hovered":
+                    self._publish_state("IDLE")
+                    continue
+
+                # Passive watch: hold head still until target reappears.
+                self._publish_state("HOVER_HOLD")
+                tp = _core.TrackerParams.from_config(self.config)
+                try:
+                    watch_reason = _core.hover_hold_and_watch(
+                        self.robot, self.cam, self.detector, self.config,
+                        self._stop_current,
+                        target_conf_min=tp.target_conf_min,
+                        on_pose=self._make_on_pose(),
+                        robot_lock=self.robot_lock,
+                    )
+                except Exception as exc:
+                    self.event_q.put(("log", f"ERROR during hover_hold: {exc}"))
+                    self._publish_state("IDLE")
+                    continue
+
+                if watch_reason == "target_visible":
+                    # Re-enter active tracking from the frozen head pose.
+                    self.event_q.put(("log", "Target visible again — resuming track"))
+                    self._publish_state("TRACKING")
+                    try:
+                        reason = _core.track(
+                            self.robot, self.cam, self.detector, self.config,
+                            self._stop_current,
+                            on_pose=self._make_on_pose(),
+                            robot_lock=self.robot_lock,
+                        )
+                    except Exception as exc:
+                        self.event_q.put(("log", f"ERROR during track (post-hover): {exc}"))
+                        reason = "error"
+                    self.event_q.put(("log", f"Track ended: {reason}"))
+
+                self._publish_state("IDLE")
 
 
 # ----- GUI ----------------------------------------------------------------
@@ -392,14 +457,20 @@ class FruitFinderGUI:
             btn_frame, text="Stop", command=self._on_stop
         )
         self.stop_btn.grid(row=1, column=0, sticky="ew", pady=2)
+        # Only meaningful while TRACKING — disabled until the worker reports that state.
+        self.hover_btn = ttk.Button(
+            btn_frame, text="Hover above target",
+            state="disabled", command=self._on_hover,
+        )
+        self.hover_btn.grid(row=2, column=0, sticky="ew", pady=2)
         self.stow_btn = ttk.Button(
             btn_frame, text="Stow arm", command=self._on_stow_arm
         )
-        self.stow_btn.grid(row=2, column=0, sticky="ew", pady=2)
+        self.stow_btn.grid(row=3, column=0, sticky="ew", pady=2)
         self.quit_btn = ttk.Button(
             btn_frame, text="Quit", command=self._on_close
         )
-        self.quit_btn.grid(row=3, column=0, sticky="ew", pady=2)
+        self.quit_btn.grid(row=4, column=0, sticky="ew", pady=2)
         btn_frame.columnconfigure(0, weight=1)
 
         status_frame = ttk.LabelFrame(right, text="Status", padding=6)
@@ -545,6 +616,10 @@ class FruitFinderGUI:
         self.arm_keyboard._stow_requested = True  # set directly for click UX
         self._log("Stow arm requested")
 
+    def _on_hover(self) -> None:
+        self.command_q.put(("hover",))
+        self._log("Hover above target requested")
+
     def _on_stop(self) -> None:
         self.command_q.put(("stop",))
         self.worker.stop_current()
@@ -663,6 +738,8 @@ class FruitFinderGUI:
                 self.state_label.configure(text=f"State: {self._state_name}")
                 if self._state_name == "IDLE":
                     self.locked_status_label.configure(text="Locked: —")
+                # Hover only makes sense once a target is locked-on.
+                self.hover_btn["state"] = "normal" if self._state_name == "TRACKING" else "disabled"
             elif kind == "acquired_label":
                 self.locked_status_label.configure(text=f"Locked: {evt[1]}")
             elif kind == "log":

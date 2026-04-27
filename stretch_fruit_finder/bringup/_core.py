@@ -908,3 +908,206 @@ def track(
         iteration += 1
 
     return reason
+
+
+# ----- hover above locked target -------------------------------------------
+
+
+def _safe_call(label: str, fn) -> None:
+    """Run fn(); log a warning on any exception so a single bad call doesn't
+    abort the rest of a hover sequence."""
+    try:
+        fn()
+    except Exception as exc:
+        logger.warning("hover: %s failed: %s", label, exc)
+
+
+def hover_above_target(
+    robot,
+    cam: CameraManager,
+    detector: FoodDetector,
+    config: dict,
+    stop_event: threading.Event,
+    arm_controller,
+    on_pose: PoseCallback = None,
+    robot_lock: Optional[threading.Lock] = None,
+) -> str:
+    """Position the gripper to hover above the currently-locked fruit.
+
+    Caller is expected to have stopped the active track loop first so the
+    head is held at the lock-on pose. Steps:
+      1. Drain a few stable frames and read the (frozen) head pose.
+      2. Run the detector once with the existing target lock.
+      3. Deproject the target's pixel center to the robot base frame
+         using `cam.pixel_to_robot_frame`.
+      4. Decide reach branch (right side / wrong side) via ArmController.
+      5. Move wrist/gripper, then lift, then arm extension under
+         `robot_lock`, with `wait_command` between stepper moves so the
+         lift fully clears before the arm extends laterally.
+
+    Returns one of "hovered", "no_target", "no_depth", "stopped", "error".
+    The head is never commanded by this function — it stays where track
+    left it.
+    """
+    arm_kbd = config.get("arm_keyboard", {}) or {}
+    lift_v = float(arm_kbd.get("lift_v_m_s", 0.5))
+    lift_a = float(arm_kbd.get("lift_a_m_s2", 0.4))
+    arm_v = float(arm_kbd.get("arm_v_m_s", 0.5))
+    arm_a = float(arm_kbd.get("arm_a_m_s2", 0.4))
+    wrist_v = float(arm_kbd.get("wrist_v_rad_s", 2.0))
+    wrist_a = float(arm_kbd.get("wrist_a_rad_s2", 4.0))
+    grip_v = float(arm_kbd.get("gripper_v", 5.0))
+    grip_a = float(arm_kbd.get("gripper_a", 10.0))
+
+    if stop_event.is_set():
+        return "stopped"
+
+    color, depth = drain_frames(cam, 6)
+    if color is None or depth is None:
+        logger.warning("hover: no frames available")
+        return "error"
+
+    with _lock_ctx(robot_lock):
+        real_pan, real_tilt = read_head_pose(robot)
+
+    detections = detector.detect(color)
+    if on_pose is not None:
+        try:
+            on_pose(color, detections, real_pan, real_tilt)
+        except Exception as exc:
+            logger.warning("on_pose callback raised: %s", exc)
+
+    target = pick_target(detections, conf_min=0.20)
+    if target is None:
+        logger.info("hover: no target in current frame; aborting")
+        return "no_target"
+
+    cx, cy = target.center
+    target_3d = cam.pixel_to_robot_frame(cx, cy, depth, real_pan, real_tilt)
+    if target_3d is None:
+        logger.info("hover: invalid depth at target center pixel; aborting")
+        return "no_depth"
+
+    x_fwd, y_left, z_up = float(target_3d[0]), float(target_3d[1]), float(target_3d[2])
+    logger.info(
+        "hover: target_3d=[x=%+.2f, y=%+.2f, z=%+.2f] head=(pan=%+.2f, tilt=%+.2f) conf=%.2f",
+        x_fwd, y_left, z_up, real_pan, real_tilt, target.confidence,
+    )
+
+    if y_left <= -0.05:
+        commands = arm_controller.position_above(target_3d)
+    else:
+        logger.info(
+            "hover: fruit not on the right (y_left=%+.2f); retracting arm and lifting to clearance",
+            y_left,
+        )
+        commands = arm_controller.position_above_unreachable(z_up)
+
+    cmd_by_joint = {c.joint: c.value for c in commands}
+    lift_target = float(cmd_by_joint.get("lift", 0.6))
+    arm_target = float(cmd_by_joint.get("arm", 0.0))
+    wrist_yaw = float(cmd_by_joint.get("wrist_yaw", 0.0))
+    wrist_pitch = float(cmd_by_joint.get("wrist_pitch", -1.57))
+    wrist_roll = float(cmd_by_joint.get("wrist_roll", 0.0))
+    grip_pct = float(cmd_by_joint.get("gripper", 50.0))
+
+    # Phase 1: orient wrist + open gripper. These are non-blocking
+    # Dynamixel commands that can run concurrently with the lift.
+    if stop_event.is_set():
+        return "stopped"
+    with _lock_ctx(robot_lock):
+        _safe_call("wrist_yaw",
+                   lambda: robot.end_of_arm.move_to("wrist_yaw", wrist_yaw, wrist_v, wrist_a))
+        _safe_call("wrist_pitch",
+                   lambda: robot.end_of_arm.move_to("wrist_pitch", wrist_pitch, wrist_v, wrist_a))
+        _safe_call("wrist_roll",
+                   lambda: robot.end_of_arm.move_to("wrist_roll", wrist_roll, wrist_v, wrist_a))
+        _safe_call("gripper.open",
+                   lambda: robot.end_of_arm.move_to("stretch_gripper", grip_pct, grip_v, grip_a))
+
+    # Phase 2: lift to clearance height first so the gripper clears any
+    # surface before the arm extends laterally.
+    if stop_event.is_set():
+        return "stopped"
+    with _lock_ctx(robot_lock):
+        _safe_call("lift.move_to",
+                   lambda: robot.lift.move_to(lift_target, lift_v, lift_a))
+        _safe_call("push_command(lift)", robot.push_command)
+        _safe_call("wait_command(lift)", robot.wait_command)
+
+    # Phase 3: extend the arm laterally to the target distance.
+    if stop_event.is_set():
+        return "stopped"
+    with _lock_ctx(robot_lock):
+        _safe_call("arm.move_to",
+                   lambda: robot.arm.move_to(arm_target, arm_v, arm_a))
+        _safe_call("push_command(arm)", robot.push_command)
+        _safe_call("wait_command(arm)", robot.wait_command)
+
+    # Phase 4: re-affirm gripper open in case it drifted during stepper moves.
+    with _lock_ctx(robot_lock):
+        _safe_call("gripper.reaffirm",
+                   lambda: robot.end_of_arm.move_to("stretch_gripper", grip_pct, grip_v, grip_a))
+
+    # One last frame so the GUI preview reflects the post-hover view.
+    color2, _depth2 = cam.get_frames()
+    if color2 is not None and on_pose is not None:
+        with _lock_ctx(robot_lock):
+            real_pan2, real_tilt2 = read_head_pose(robot)
+        try:
+            on_pose(color2, [], real_pan2, real_tilt2)
+        except Exception as exc:
+            logger.warning("on_pose callback raised: %s", exc)
+
+    logger.info(
+        "hover: complete (lift=%.2f arm=%.2f wrist_pitch=%.2f gripper=%.0f)",
+        lift_target, arm_target, wrist_pitch, grip_pct,
+    )
+    return "hovered"
+
+
+def hover_hold_and_watch(
+    robot,
+    cam: CameraManager,
+    detector: FoodDetector,
+    config: dict,
+    stop_event: threading.Event,
+    target_conf_min: float,
+    on_pose: PoseCallback = None,
+    robot_lock: Optional[threading.Lock] = None,
+    poll_period_s: float = 0.05,
+) -> str:
+    """Hold head still after a hover, but keep detecting; return when the
+    target reappears so the caller can re-enter active tracking.
+
+    No head motion at all — this is the user's "freeze the head" mode.
+    Returns "target_visible" when a target detection appears with
+    confidence >= target_conf_min, or "stopped" when stop_event fires.
+    """
+    logger.info(
+        "hover_hold: passive watch (target_conf_min=%.2f) — head will not move until target reappears",
+        target_conf_min,
+    )
+    while not stop_event.is_set():
+        color, _depth = cam.get_frames()
+        if color is None:
+            time.sleep(poll_period_s)
+            continue
+
+        with _lock_ctx(robot_lock):
+            real_pan, real_tilt = read_head_pose(robot)
+        detections = detector.detect(color)
+
+        if on_pose is not None:
+            try:
+                on_pose(color, detections, real_pan, real_tilt)
+            except Exception as exc:
+                logger.warning("on_pose callback raised: %s", exc)
+
+        if pick_target(detections, target_conf_min) is not None:
+            logger.info("hover_hold: target reappeared; resuming active track")
+            return "target_visible"
+
+        time.sleep(poll_period_s)
+
+    return "stopped"

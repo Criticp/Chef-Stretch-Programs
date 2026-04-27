@@ -54,25 +54,21 @@ class ArmController:
 
         target_3d: [x_forward, y_left, z_height] in robot base frame (meters).
 
-        The lift moves to target_z + height_above.
-        The arm extends to target_x (clamped to max_extension).
-        The wrist pitches down to point at the object.
-
-        NOTE: This assumes the robot is already facing the object (y ~= 0).
-        The approach phase should have aligned the robot to face the target.
+        On Stretch, the arm is a single prismatic joint that extends
+        laterally to the **right** of the base. So:
+          - lift  = target_z + height_above_object_m
+          - arm   = max(0, -y_left)  # fruit on the right has y_left < 0
+        x_forward is informational only (logged) — the arm cannot move
+        forward/back to compensate, so the gripper hovers at the arm
+        base's x. Caller is expected to have positioned the base such
+        that the fruit is roughly at x_forward = 0.
         """
         x_forward = float(target_3d[0])
+        y_left = float(target_3d[1])
         z_height = float(target_3d[2])
 
-        # Compute lift height: object height + offset above.
-        lift_target = z_height + self._height_above
-        lift_target = np.clip(lift_target, self._min_lift, self._max_lift)
-
-        # Compute arm extension: how far forward the object is.
-        # The arm extends from the base, so extension = x_forward minus the
-        # base-to-shoulder offset (~0.05m, absorbed into the target).
-        arm_target = max(0.0, x_forward - 0.05)
-        arm_target = min(arm_target, self._max_extension)
+        lift_target = float(np.clip(z_height + self._height_above, self._min_lift, self._max_lift))
+        arm_target = float(np.clip(max(0.0, -y_left), 0.0, self._max_extension))
 
         commands = [
             MotorCommand("lift", lift_target),
@@ -84,12 +80,34 @@ class ArmController:
         ]
 
         logger.info(
-            "Arm position_above: lift=%.2f arm=%.2f (target_3d=[%.2f, %.2f, %.2f])",
-            lift_target,
-            arm_target,
-            target_3d[0],
-            target_3d[1],
-            target_3d[2],
+            "Arm position_above: lift=%.2f arm=%.2f  (target=[x=%.2f, y=%.2f, z=%.2f], x_offset=%+.2f)",
+            lift_target, arm_target,
+            x_forward, y_left, z_height, x_forward,
+        )
+        return commands
+
+    def position_above_unreachable(self, z_height: float) -> List[MotorCommand]:
+        """Best-effort pose when the fruit is on the wrong side of the robot.
+
+        Stretch's arm only extends to the right; if the fruit is on the
+        left or directly under the robot, lateral extension can't reach
+        it. Retract the arm fully and lift to the clearance height so
+        the gripper is in a safe ready pose without sweeping across the
+        robot's centreline.
+        """
+        lift_target = float(np.clip(z_height + self._height_above, self._min_lift, self._max_lift))
+
+        commands = [
+            MotorCommand("arm", 0.0),
+            MotorCommand("lift", lift_target),
+            MotorCommand("wrist_yaw", 0.0),
+            MotorCommand("wrist_pitch", self._reach_wrist_pitch),
+            MotorCommand("wrist_roll", 0.0),
+            MotorCommand("gripper", 50),
+        ]
+        logger.info(
+            "Arm position_above_unreachable: lift=%.2f arm=0 (z_height=%.2f)",
+            lift_target, z_height,
         )
         return commands
 

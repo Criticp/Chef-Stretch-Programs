@@ -68,7 +68,7 @@ tracking:
   reacquire_accel_rad_per_s2: 0.8  # Slew acceleration cap during re-acquire (rad/s^2)
 
 arm:
-  height_above_object_m: 0.15      # How far above the object to position the gripper
+  height_above_object_m: 0.15      # Gripper clearance above the object — used by the "Hover above target" button
   max_extension_m: 0.5             # Maximum arm extension
   min_lift_m: 0.05                 # Minimum lift height
   max_lift_m: 1.05                 # Maximum lift height
