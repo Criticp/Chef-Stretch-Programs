@@ -66,6 +66,32 @@ arm:
   search_lift_m: 0.8               # Lift height during search
   reach_wrist_pitch: -1.57         # Wrist pitch when reaching (point down)
 
+# Tunables for the keyboard arm/lift/wrist/gripper teleop in the L4 GUI.
+# All keys are optional; any missing key falls back to the safe defaults
+# baked into _arm_keyboard_driver.DEFAULTS. Velocity / acceleration
+# values match Hello Robot's xbox teleop "regular" envelope.
+# Contact thresholds (Newtons) tell the firmware to halt the joint
+# automatically if external force exceeds the threshold — this is what
+# protects the arm from crushing into walls, countertops, or fingers.
+arm_keyboard:
+  # Velocity / acceleration caps used in set_velocity (steppers) and
+  # move_to (Dynamixels).
+  lift_v_m_s: 0.10
+  lift_a_m_s2: 0.20
+  arm_v_m_s: 0.10
+  arm_a_m_s2: 0.20
+  wrist_v_rad_s: 2.0
+  wrist_a_rad_s2: 4.0
+  gripper_v: 3.0
+  gripper_a: 5.0
+  # Contact-force thresholds (Newtons). Joint motion halts immediately
+  # if external force exceeds these. Conservative bringup values; raise
+  # for heavier manipulation if needed.
+  lift_contact_thresh_pos_N: 60.0
+  lift_contact_thresh_neg_N: -60.0
+  arm_contact_thresh_pos_N: 30.0
+  arm_contact_thresh_neg_N: -30.0
+
 gamepad:
   toggle_button: 7                 # Start button — toggle AUTO/MANUAL
   arm_button: 0                    # A button — trigger arm positioning

@@ -77,6 +77,7 @@ from fruit_finder.detector import COCO_FOOD_NAMES, Detection, FoodDetector  # no
 from fruit_finder.gamepad import GamepadState, GamepadThread  # noqa: E402
 import _arm_exec  # noqa: E402
 import _arm_keyboard_driver  # noqa: E402
+import _arm_keyboard_driver  # noqa: E402
 import _core  # noqa: E402
 import _gamepad_exec  # noqa: E402
 import _keyboard_driver  # noqa: E402
@@ -838,6 +839,25 @@ def main() -> int:
             cam.stop()
             return 1
 
+        # Safety-state report: log calibration + collision-management state
+        # so the operator (and any later debugging session) can see what
+        # was active during the run.
+        try:
+            collision_on = bool(getattr(robot, "collision", None) is not None
+                                and getattr(robot, "collision_mgmt_enabled", True))
+        except Exception:
+            collision_on = True  # default in stretch_body
+        runstop_now = _arm_keyboard_driver._is_runstopped(robot)
+        print(
+            f"Robot ready: homed=True  collision_mgmt={'on' if collision_on else 'off'}  "
+            f"runstop={'ACTIVE' if runstop_now else 'released'}"
+        )
+        if runstop_now:
+            print(
+                "WARNING: runstop is currently active. Motion commands "
+                "will be ignored until you release the runstop button."
+            )
+
         # Start the gamepad reader thread. It only READS input; it doesn't
         # touch the robot on its own, so order relative to the executor
         # doesn't matter.
@@ -882,8 +902,15 @@ def main() -> int:
             gp_thread.join(timeout=2.0)
 
         if started:
-            # In case the gamepad executor didn't get a chance to stop the
-            # base, zero it explicitly before we let go of the robot.
+            # In case any executor didn't get a chance to stop its joints,
+            # zero everything explicitly before we let go of the robot.
+            #   - hard_stop() handles lift / arm / wrist / gripper
+            #   - the base block here mirrors what GamepadExecutor's
+            #     finally would have done
+            try:
+                _arm_keyboard_driver.hard_stop(robot, robot_lock, config)
+            except Exception:
+                pass
             try:
                 with robot_lock:
                     robot.base.set_velocity(0.0, 0.0)
