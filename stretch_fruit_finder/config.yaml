@@ -83,11 +83,16 @@ arm:
   stow_wrist_roll: 0.0
   # Stow fully closes the gripper. 0 = fully closed, 100 = fully open.
   stow_gripper_pct: 0
-  # Hover uses a barely-cracked gripper (closer to fully closed than open)
-  # so the gripper occludes the fruit cleanly during the lift / arm
-  # visual servo. Slightly above 0 to avoid pinching, but well below the
-  # neutral half-open value of 50.
-  hover_gripper_pct: 10
+  # Hover keeps the gripper fully closed too — narrowest, cleanest
+  # silhouette for occluding the fruit during the lift / arm visual
+  # servo, and matches stow so Hover doesn't visibly re-open the gripper.
+  hover_gripper_pct: 0
+  # Upper-bound lift height that Hover's lift visual servo will sweep
+  # toward. Caps how high the arm can rise looking for the gripper to
+  # occlude the fruit. Independent of the hardware max_lift_m so the
+  # operator can constrain Hover without losing the joint's full range
+  # for keyboard teleop or future routines.
+  hover_max_lift_m: 0.89
   search_lift_m: 0.8               # Lift height during search
   reach_wrist_pitch: -1.57         # Wrist pitch when reaching (point down)
 

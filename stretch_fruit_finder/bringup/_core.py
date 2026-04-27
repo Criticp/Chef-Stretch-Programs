@@ -1129,9 +1129,14 @@ def hover_above_target(
     max_extension = float(arm_cfg.get("max_extension_m", 0.5))
     max_lift = float(arm_cfg.get("max_lift_m", 1.05))
     stow_lift = float(arm_cfg.get("stow_lift_m", 0.6))
-    # Hover uses a slightly-closed gripper (narrow but not pinched) for
-    # clean occlusion during the visual servo. Falls back to 25 if not set.
-    grip_pct = float(arm_cfg.get("hover_gripper_pct", 25.0))
+    # Hover-specific upper bound for the lift visual servo. Caps how high
+    # the arm can sweep while looking for occlusion; independent of the
+    # hardware max_lift_m. Clamped to that hardware cap as a safety net
+    # in case the config is set higher.
+    hover_max_lift = min(float(arm_cfg.get("hover_max_lift_m", 0.89)), max_lift)
+    # Gripper closed for hover; matches stow so the gripper doesn't visibly
+    # re-open between Stow and Hover.
+    grip_pct = float(arm_cfg.get("hover_gripper_pct", 0.0))
 
     trk_cfg = config.get("tracking", {}) or {}
     target_conf_min = float(trk_cfg.get("target_conf_min", 0.25))
@@ -1232,10 +1237,13 @@ def hover_above_target(
     #    The lift starts from wherever the arm currently is (typically
     #    stow_lift after a Stow press) and rises to find the height at
     #    which the gripper crosses the camera-to-fruit line of sight.
-    logger.info("hover: phase 0 — lift visual servo to find correct height")
+    #    Capped at hover_max_lift, not the joint's hardware max, so the
+    #    arm can't end up at full extension if depth is unhelpful.
+    logger.info("hover: phase 0 — lift visual servo to find correct height (max=%.2f m)",
+                hover_max_lift)
     lift_result = _scan_joint_for_visibility(
         robot, "lift", cam, detector,
-        target_pos=max_lift,
+        target_pos=hover_max_lift,
         scan_v=scan_v_lift, scan_a=scan_a_lift,
         halt_v=lift_v, halt_a=lift_a,
         target_conf_min=target_conf_min,
