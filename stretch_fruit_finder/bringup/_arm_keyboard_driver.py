@@ -238,12 +238,11 @@ class ArmKeyboardDriver:
     tick by the ArmExecutor thread.
     """
 
-    # Autorepeat fake-release suppression window — see _keyboard_driver.py
-    # for the rationale. X11 generates alternating KeyPress/KeyRelease at
-    # the autorepeat rate while a key is held; we defer real releases by
-    # this many ms and cancel them if a KeyPress for the same key arrives
-    # in that window.
-    _AUTOREPEAT_DEBOUNCE_MS = 30
+    # Autorepeat fake-release suppression — see _keyboard_driver.py for the
+    # full rationale. Two complementary checks: X11 timestamp equality
+    # between an autorepeat KeyRelease and the following KeyPress (primary),
+    # and a deferred timer as a fallback when GUI load skews event timing.
+    _AUTOREPEAT_DEBOUNCE_MS = 120
 
     def __init__(self, root: tk.Misc, config: Optional[dict] = None):
         self._root = root
@@ -254,6 +253,7 @@ class ArmKeyboardDriver:
 
         self._pressed: Set[str] = set()
         self._pending_releases: Dict[str, str] = {}  # keysym -> after-id
+        self._last_press_time: Dict[str, int] = {}   # keysym -> X11 server time of last KeyPress
         self._stow_requested = False
         self._lock = threading.Lock()
 
@@ -290,7 +290,14 @@ class ArmKeyboardDriver:
         sym = event.keysym
         if not self._is_mapped(sym):
             return
-        # Cancel any pending release for the same key — autorepeat fake.
+        # Stow is edge-triggered, not held — short-circuit before recording
+        # press time / cancelling deferred releases.
+        if sym in _STOW_KEYS:
+            with self._lock:
+                self._stow_requested = True
+            return
+        self._last_press_time[sym] = int(getattr(event, "time", 0))
+        # Cancel any in-flight deferred release for this key.
         pending = self._pending_releases.pop(sym, None)
         if pending is not None:
             try:
@@ -298,21 +305,20 @@ class ArmKeyboardDriver:
             except Exception:
                 pass
         with self._lock:
-            # Stow is edge-triggered, not held. Set the one-shot flag
-            # but don't add to pressed set (we don't want stow firing
-            # every tick).
-            if sym in _STOW_KEYS:
-                self._stow_requested = True
-                return
             self._pressed.add(sym)
 
     def _on_release(self, event) -> None:
         sym = event.keysym
         if not self._is_mapped(sym):
             return
-        # Stow has no held state to clear; nothing to defer either.
         if sym in _STOW_KEYS:
             return
+        release_time = int(getattr(event, "time", 0))
+        # Check 1: identical X11 timestamps mean autorepeat fake.
+        last_press = self._last_press_time.get(sym)
+        if last_press is not None and release_time and last_press == release_time:
+            return
+        # Check 2 (fallback): defer the discard. KeyPress within the window cancels.
         existing = self._pending_releases.pop(sym, None)
         if existing is not None:
             try:
@@ -320,11 +326,15 @@ class ArmKeyboardDriver:
             except Exception:
                 pass
         self._pending_releases[sym] = self._root.after(
-            self._AUTOREPEAT_DEBOUNCE_MS, lambda s=sym: self._real_release(s)
+            self._AUTOREPEAT_DEBOUNCE_MS,
+            lambda s=sym, t=release_time: self._real_release(s, t),
         )
 
-    def _real_release(self, sym: str) -> None:
+    def _real_release(self, sym: str, release_time: int) -> None:
         self._pending_releases.pop(sym, None)
+        last_press = self._last_press_time.get(sym)
+        if last_press is not None and release_time and last_press > release_time:
+            return
         with self._lock:
             self._pressed.discard(sym)
 

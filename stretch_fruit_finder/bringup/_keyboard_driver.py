@@ -59,13 +59,19 @@ class KeyboardDriver:
     which keys are pressed right now.
     """
 
-    # Autorepeat fake-release suppression window. On X11/Linux, holding a
-    # key generates alternating KeyPress + KeyRelease events at the OS
-    # autorepeat rate (~30 Hz), which would otherwise toggle the held-key
-    # set off for ~1 ms each cycle and stutter the motion. We defer real
-    # releases by this many ms; if a KeyPress arrives in that window we
-    # treat it as autorepeat and cancel the release.
-    _AUTOREPEAT_DEBOUNCE_MS = 30
+    # Autorepeat fake-release suppression. On X11/Linux, holding a key
+    # generates alternating KeyPress + KeyRelease events at the OS
+    # autorepeat rate; a fake release would otherwise stutter the motion.
+    # We use two complementary checks, since either alone can fail under
+    # GUI load:
+    #   1) `event.time` equality — X11 stamps autorepeat KeyRelease and
+    #      the following KeyPress with the same server timestamp, so a
+    #      release whose time matches the most-recent press is fake.
+    #   2) A timer-based fallback — defer the discard for this many ms;
+    #      if a KeyPress for the same key arrives in that window, cancel
+    #      the discard. Generous enough to absorb tens of ms of skew
+    #      from a busy Tk main loop.
+    _AUTOREPEAT_DEBOUNCE_MS = 120
 
     def __init__(self, root: tk.Misc, config: dict):
         self._root = root
@@ -75,6 +81,7 @@ class KeyboardDriver:
 
         self._pressed: set[str] = set()
         self._pending_releases: dict[str, str] = {}  # keysym -> after-id
+        self._last_press_time: dict[str, int] = {}   # keysym -> X11 server time of last KeyPress
         self._lock = threading.Lock()
 
         # `bind_all` so the keys are picked up no matter which tkinter
@@ -91,18 +98,22 @@ class KeyboardDriver:
 
     # ------------------------------------------------------------------
 
-    def _on_press(self, event) -> None:
-        sym = event.keysym
-        # Only track the symbols we care about — avoids hoarding random keys.
-        if not (
+    def _is_mapped(self, sym: str) -> bool:
+        return (
             sym in _FORWARD_KEYS
             or sym in _BACKWARD_KEYS
             or sym in _LEFT_KEYS
             or sym in _RIGHT_KEYS
-        ):
+        )
+
+    def _on_press(self, event) -> None:
+        sym = event.keysym
+        if not self._is_mapped(sym):
             return
-        # Cancel any pending release for the same key — that release was
-        # an X11 autorepeat fake, not a real key-up.
+        # Record the X11 server time so a subsequent KeyRelease can detect
+        # autorepeat by timestamp equality.
+        self._last_press_time[sym] = int(getattr(event, "time", 0))
+        # Cancel any in-flight deferred release — autorepeat fake or rebound press.
         pending = self._pending_releases.pop(sym, None)
         if pending is not None:
             try:
@@ -114,8 +125,17 @@ class KeyboardDriver:
 
     def _on_release(self, event) -> None:
         sym = event.keysym
-        # Defer the actual clearance. If a KeyPress for the same key
-        # arrives in the debounce window, this will be cancelled.
+        if not self._is_mapped(sym):
+            return
+        release_time = int(getattr(event, "time", 0))
+        # Check 1: if the most recent KeyPress has the same X11 timestamp
+        # as this KeyRelease, this release is an autorepeat fake — bail.
+        last_press = self._last_press_time.get(sym)
+        if last_press is not None and release_time and last_press == release_time:
+            return
+        # Check 2 (fallback): defer the discard via timer. If a KeyPress
+        # for the same key arrives in the debounce window (autorepeat that
+        # somehow slipped past check 1), it will cancel the timer.
         existing = self._pending_releases.pop(sym, None)
         if existing is not None:
             try:
@@ -123,11 +143,17 @@ class KeyboardDriver:
             except Exception:
                 pass
         self._pending_releases[sym] = self._root.after(
-            self._AUTOREPEAT_DEBOUNCE_MS, lambda s=sym: self._real_release(s)
+            self._AUTOREPEAT_DEBOUNCE_MS,
+            lambda s=sym, t=release_time: self._real_release(s, t),
         )
 
-    def _real_release(self, sym: str) -> None:
+    def _real_release(self, sym: str, release_time: int) -> None:
         self._pending_releases.pop(sym, None)
+        # Final safety: if a press with a strictly later timestamp than this
+        # release came in during the wait, the key is still down — keep it.
+        last_press = self._last_press_time.get(sym)
+        if last_press is not None and release_time and last_press > release_time:
+            return
         with self._lock:
             self._pressed.discard(sym)
 
