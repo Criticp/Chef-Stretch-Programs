@@ -81,12 +81,15 @@ arm:
   stow_wrist_yaw: 0.0
   stow_wrist_pitch: 0.0            # Horizontal — gripper points outward along the arm
   stow_wrist_roll: 0.0
-  # Stow fully closes the gripper. 0 = fully closed, 100 = fully open.
-  stow_gripper_pct: 0
-  # Hover keeps the gripper fully closed too — narrowest, cleanest
-  # silhouette for occluding the fruit during the lift / arm visual
-  # servo, and matches stow so Hover doesn't visibly re-open the gripper.
-  hover_gripper_pct: 0
+  # Stretch gripper position is SIGNED: positive = open, 0 = jaws just
+  # touching, negative = squeezed closed (firmware clamps the lower end).
+  # -100 lands at the fully-squeezed mechanical close. The historical
+  # *_pct name is kept so older configs still load.
+  stow_gripper_pct: -100
+  # Hover squeezes the gripper closed too — narrowest, cleanest silhouette
+  # for occluding the fruit during the lift / arm visual servo, and
+  # matches stow so Hover doesn't visibly re-open the jaws.
+  hover_gripper_pct: -100
   # Upper-bound lift height that Hover's lift visual servo will sweep
   # toward. Caps how high the arm can rise looking for the gripper to
   # occlude the fruit. Independent of the hardware max_lift_m so the

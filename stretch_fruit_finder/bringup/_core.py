@@ -1255,13 +1255,14 @@ def hover_above_target(
     if lift_result == "stopped":
         return "stopped"
     if lift_result != "passed":
-        logger.warning("hover: lift phase ended as %r — lowering back to stow_lift", lift_result)
-        with _lock_ctx(robot_lock):
-            _safe_call("lift.recover",
-                       lambda: robot.lift.move_to(stow_lift, lift_v, lift_a))
-            _safe_call("push_command(lift recover)", robot.push_command)
-            _safe_call("wait_command(lift recover)", robot.wait_command)
-        return "lift_no_cover"
+        logger.warning(
+            "hover: lift phase ended as %r at %.2f m — proceeding with arm extension anyway",
+            lift_result, _read_joint_pos(robot, "lift"),
+        )
+        # Don't bail. Leave the lift at whatever height the scan stopped
+        # at and let the arm extension visual servo do its work; the
+        # height is at most hover_max_lift_m off and the operator told
+        # us to keep going.
 
     if stop_event.is_set():
         return "stopped"
