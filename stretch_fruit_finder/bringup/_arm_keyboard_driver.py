@@ -474,6 +474,9 @@ class ArmKeyboardDriver:
         stow_yaw = float(arm_cfg.get("stow_wrist_yaw", 0.0))
         stow_pitch = float(arm_cfg.get("stow_wrist_pitch", -0.5))
         stow_roll = float(arm_cfg.get("stow_wrist_roll", 0.0))
+        stow_grip = float(arm_cfg.get("stow_gripper_pct", 25.0))
+        grip_v = float(self._p.get("gripper_v", 5.0))
+        grip_a = float(self._p.get("gripper_a", 10.0))
 
         def _safe(fn_name: str, fn):
             try:
@@ -487,12 +490,13 @@ class ArmKeyboardDriver:
             _safe("push_command", robot.push_command)
             _safe("wait_command", robot.wait_command)
 
-            # Phase 2: lift + wrist pose together.
+            # Phase 2: lift + wrist pose + gripper together.
             _safe("lift.move_to", lambda: robot.lift.move_to(stow_lift, 0.1, 0.2))
             _safe("push_command", robot.push_command)
             _safe("wrist_yaw", lambda: robot.end_of_arm.move_to("wrist_yaw", stow_yaw, 2.0, 4.0))
             _safe("wrist_pitch", lambda: robot.end_of_arm.move_to("wrist_pitch", stow_pitch, 2.0, 4.0))
             _safe("wrist_roll", lambda: robot.end_of_arm.move_to("wrist_roll", stow_roll, 2.0, 4.0))
+            _safe("gripper", lambda: robot.end_of_arm.move_to("stretch_gripper", stow_grip, grip_v, grip_a))
             _safe("wait_command", robot.wait_command)
 
         logger.info("arm stow: starting sequence")

@@ -81,6 +81,10 @@ arm:
   stow_wrist_yaw: 0.0
   stow_wrist_pitch: 0.0            # Horizontal — gripper points outward along the arm
   stow_wrist_roll: 0.0
+  # Slightly-closed gripper. Narrower than open so it occludes the fruit
+  # cleanly during the hover lift/arm visual servo. Used by both stow and
+  # the Hover routine. 0 = fully closed, 100 = fully open.
+  stow_gripper_pct: 25
   search_lift_m: 0.8               # Lift height during search
   reach_wrist_pitch: -1.57         # Wrist pitch when reaching (point down)
 
