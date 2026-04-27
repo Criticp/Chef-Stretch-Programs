@@ -1128,7 +1128,9 @@ def hover_above_target(
     max_extension = float(arm_cfg.get("max_extension_m", 0.5))
     max_lift = float(arm_cfg.get("max_lift_m", 1.05))
     stow_lift = float(arm_cfg.get("stow_lift_m", 0.6))
-    grip_pct = float(arm_cfg.get("stow_gripper_pct", 25.0))  # slightly-closed for clean occlusion
+    # Hover uses a slightly-closed gripper (narrow but not pinched) for
+    # clean occlusion during the visual servo. Falls back to 25 if not set.
+    grip_pct = float(arm_cfg.get("hover_gripper_pct", 25.0))
 
     trk_cfg = config.get("tracking", {}) or {}
     target_conf_min = float(trk_cfg.get("target_conf_min", 0.25))
