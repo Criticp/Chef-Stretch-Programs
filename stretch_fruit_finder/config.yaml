@@ -24,8 +24,13 @@ detection:
   kitchen_classes: [39, 41, 43, 44, 45, 60, 68, 69, 70, 71, 72]
 
 navigation:
-  search_pan_min_rad: -1.5         # Head pan sweep start
-  search_pan_max_rad: 1.5          # Head pan sweep end
+  # head_pan hardware range on Stretch RE2 is approximately [-3.95, +1.65]
+  # rad (negative = right, positive = left; asymmetric due to cable run).
+  # We set these slightly outside the documented limits so the runtime
+  # clamp in get_head_limits() pulls them back to whatever the live
+  # robot's soft_motion_limits report — that gives us the full sweep.
+  search_pan_min_rad: -3.9         # Full pan to the right (clamped to live soft limit)
+  search_pan_max_rad: 1.6          # Full pan to the left (clamped to live soft limit)
   search_pan_step_rad: 0.3         # (legacy) Pan step — unused by the continuous-slew sweep
   search_tilt_rad: -0.6            # (legacy) Single-row tilt — used only if search_tilt_rows_rad is unset
   search_tilt_rows_rad:            # Tilt rows the sweep visits in order (floor / mid / counter+hand height)
