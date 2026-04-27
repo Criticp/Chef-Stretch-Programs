@@ -238,6 +238,13 @@ class ArmKeyboardDriver:
     tick by the ArmExecutor thread.
     """
 
+    # Autorepeat fake-release suppression window — see _keyboard_driver.py
+    # for the rationale. X11 generates alternating KeyPress/KeyRelease at
+    # the autorepeat rate while a key is held; we defer real releases by
+    # this many ms and cancel them if a KeyPress for the same key arrives
+    # in that window.
+    _AUTOREPEAT_DEBOUNCE_MS = 30
+
     def __init__(self, root: tk.Misc, config: Optional[dict] = None):
         self._root = root
 
@@ -246,6 +253,7 @@ class ArmKeyboardDriver:
         self._p: Dict[str, Optional[float]] = {**DEFAULTS, **arm_cfg}
 
         self._pressed: Set[str] = set()
+        self._pending_releases: Dict[str, str] = {}  # keysym -> after-id
         self._stow_requested = False
         self._lock = threading.Lock()
 
@@ -282,6 +290,13 @@ class ArmKeyboardDriver:
         sym = event.keysym
         if not self._is_mapped(sym):
             return
+        # Cancel any pending release for the same key — autorepeat fake.
+        pending = self._pending_releases.pop(sym, None)
+        if pending is not None:
+            try:
+                self._root.after_cancel(pending)
+            except Exception:
+                pass
         with self._lock:
             # Stow is edge-triggered, not held. Set the one-shot flag
             # but don't add to pressed set (we don't want stow firing
@@ -292,8 +307,26 @@ class ArmKeyboardDriver:
             self._pressed.add(sym)
 
     def _on_release(self, event) -> None:
+        sym = event.keysym
+        if not self._is_mapped(sym):
+            return
+        # Stow has no held state to clear; nothing to defer either.
+        if sym in _STOW_KEYS:
+            return
+        existing = self._pending_releases.pop(sym, None)
+        if existing is not None:
+            try:
+                self._root.after_cancel(existing)
+            except Exception:
+                pass
+        self._pending_releases[sym] = self._root.after(
+            self._AUTOREPEAT_DEBOUNCE_MS, lambda s=sym: self._real_release(s)
+        )
+
+    def _real_release(self, sym: str) -> None:
+        self._pending_releases.pop(sym, None)
         with self._lock:
-            self._pressed.discard(event.keysym)
+            self._pressed.discard(sym)
 
     # ------------------------------------------------------------------
 

@@ -59,6 +59,14 @@ class KeyboardDriver:
     which keys are pressed right now.
     """
 
+    # Autorepeat fake-release suppression window. On X11/Linux, holding a
+    # key generates alternating KeyPress + KeyRelease events at the OS
+    # autorepeat rate (~30 Hz), which would otherwise toggle the held-key
+    # set off for ~1 ms each cycle and stutter the motion. We defer real
+    # releases by this many ms; if a KeyPress arrives in that window we
+    # treat it as autorepeat and cancel the release.
+    _AUTOREPEAT_DEBOUNCE_MS = 30
+
     def __init__(self, root: tk.Misc, config: dict):
         self._root = root
         gp_cfg = config.get("gamepad", {}) or {}
@@ -66,6 +74,7 @@ class KeyboardDriver:
         self.max_rot_rad_s = float(gp_cfg.get("base_rotate_speed", 0.15))
 
         self._pressed: set[str] = set()
+        self._pending_releases: dict[str, str] = {}  # keysym -> after-id
         self._lock = threading.Lock()
 
         # `bind_all` so the keys are picked up no matter which tkinter
@@ -85,18 +94,42 @@ class KeyboardDriver:
     def _on_press(self, event) -> None:
         sym = event.keysym
         # Only track the symbols we care about — avoids hoarding random keys.
-        if (
+        if not (
             sym in _FORWARD_KEYS
             or sym in _BACKWARD_KEYS
             or sym in _LEFT_KEYS
             or sym in _RIGHT_KEYS
         ):
-            with self._lock:
-                self._pressed.add(sym)
+            return
+        # Cancel any pending release for the same key — that release was
+        # an X11 autorepeat fake, not a real key-up.
+        pending = self._pending_releases.pop(sym, None)
+        if pending is not None:
+            try:
+                self._root.after_cancel(pending)
+            except Exception:
+                pass
+        with self._lock:
+            self._pressed.add(sym)
 
     def _on_release(self, event) -> None:
+        sym = event.keysym
+        # Defer the actual clearance. If a KeyPress for the same key
+        # arrives in the debounce window, this will be cancelled.
+        existing = self._pending_releases.pop(sym, None)
+        if existing is not None:
+            try:
+                self._root.after_cancel(existing)
+            except Exception:
+                pass
+        self._pending_releases[sym] = self._root.after(
+            self._AUTOREPEAT_DEBOUNCE_MS, lambda s=sym: self._real_release(s)
+        )
+
+    def _real_release(self, sym: str) -> None:
+        self._pending_releases.pop(sym, None)
         with self._lock:
-            self._pressed.discard(event.keysym)
+            self._pressed.discard(sym)
 
     # ------------------------------------------------------------------
 
