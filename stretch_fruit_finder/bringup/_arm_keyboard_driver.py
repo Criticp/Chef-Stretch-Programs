@@ -264,6 +264,12 @@ class ArmKeyboardDriver:
         # (autorepeat keeps a held key in the snapshot).
         self._last_press_monotonic: Dict[str, float] = {}
         self._stow_requested = False
+        # Persistent wrist-yaw preference set by the GUI's "Gripper inward"
+        # toggle. 0 = gripper points outward along arm extension; pi =
+        # gripper rotated 180 deg to point inward toward the robot. Used
+        # by apply_stow and surfaced via get_wrist_yaw_target() so the
+        # Hover routine and any other consumer can honor the same value.
+        self._wrist_yaw_target_rad = 0.0
         self._lock = threading.Lock()
 
         # Only KeyPress is bound; KeyRelease has no semantic role in this
@@ -353,6 +359,15 @@ class ArmKeyboardDriver:
             out = self._stow_requested
             self._stow_requested = False
             return out
+
+    def set_wrist_yaw_target(self, yaw_rad: float) -> None:
+        """Persistent setting from the GUI's Gripper-orientation toggle."""
+        with self._lock:
+            self._wrist_yaw_target_rad = float(yaw_rad)
+
+    def get_wrist_yaw_target(self) -> float:
+        with self._lock:
+            return self._wrist_yaw_target_rad
 
     def is_active(self) -> bool:
         """True if any motion chunks are queued or stow is pending."""
@@ -466,7 +481,11 @@ class ArmKeyboardDriver:
         arm_cfg = config.get("arm", {}) or {}
         stow_arm = float(arm_cfg.get("stow_arm_m", 0.0))
         stow_lift = float(arm_cfg.get("stow_lift_m", 0.8))
-        stow_yaw = float(arm_cfg.get("stow_wrist_yaw", 0.0))
+        # Wrist yaw honors the runtime toggle (Gripper inward / outward)
+        # so that pressing Stow leaves the gripper in the user-selected
+        # orientation. Falls back to the config value the first time the
+        # toggle hasn't been touched (which currently equals 0 anyway).
+        stow_yaw = self.get_wrist_yaw_target()
         stow_pitch = float(arm_cfg.get("stow_wrist_pitch", -0.5))
         stow_roll = float(arm_cfg.get("stow_wrist_roll", 0.0))
         stow_grip = float(arm_cfg.get("stow_gripper_pct", 25.0))
