@@ -265,23 +265,6 @@ class Worker(threading.Thread):
                 else:
                     _core.center_head(self.robot, robot_lock=self.robot_lock)
 
-            if cmd[0] == "set_wrist_yaw":
-                yaw = float(cmd[1])
-                arm_kbd_p = self.arm_keyboard._p  # already-validated tunables
-                wrist_v = float(arm_kbd_p.get("wrist_v_rad_s", 2.0))
-                wrist_a = float(arm_kbd_p.get("wrist_a_rad_s2", 4.0))
-                try:
-                    with _core._lock_ctx(self.robot_lock):
-                        self.robot.end_of_arm.move_to("wrist_yaw", yaw, wrist_v, wrist_a)
-                except Exception as exc:
-                    self.event_q.put(("log", f"set_wrist_yaw failed: {exc}"))
-                else:
-                    self.event_q.put((
-                        "log",
-                        f"Wrist yaw -> {yaw:+.2f} rad ({'inward' if abs(yaw) > 1.0 else 'outward'})",
-                    ))
-                continue
-
             if cmd[0] == "hover":
                 # The track loop has already exited (request_hover set
                 # _stop_current); clear it so this branch's own loops
@@ -697,12 +680,33 @@ class FruitFinderGUI:
         # (rotated 180 deg so the gripper points back at the robot).
         inward = bool(self.gripper_inward_var.get())
         yaw_rad = float(np.pi) if inward else 0.0
-        # Persist the preference on the driver so any future Stow / Hover
-        # uses it without needing the GUI in the loop.
+        # Persist the preference on the driver so future Stow / Hover use
+        # it without the GUI in the loop.
         self.arm_keyboard.set_wrist_yaw_target(yaw_rad)
-        # Tell the Worker to apply the new yaw to the live wrist now.
-        self.command_q.put(("set_wrist_yaw", yaw_rad))
-        self._log(f"Gripper orientation: {'inward' if inward else 'outward'} (yaw -> {yaw_rad:+.2f} rad)")
+        # Apply immediately on the Tk thread. Going through the Worker's
+        # command_q would only fire after track() / hover() returned;
+        # the wrist is a Dynamixel so the move_to call itself is quick
+        # and just needs to acquire robot_lock briefly.
+        arm_kbd_p = self.arm_keyboard._p
+        wrist_v = float(arm_kbd_p.get("wrist_v_rad_s", 2.0))
+        wrist_a = float(arm_kbd_p.get("wrist_a_rad_s2", 4.0))
+        try:
+            if self.robot_lock is not None:
+                with self.robot_lock:
+                    self.robot.end_of_arm.move_to(
+                        "wrist_yaw", yaw_rad, wrist_v, wrist_a,
+                    )
+            else:
+                self.robot.end_of_arm.move_to(
+                    "wrist_yaw", yaw_rad, wrist_v, wrist_a,
+                )
+        except Exception as exc:
+            self._log(f"Gripper orientation move failed: {exc}")
+            return
+        self._log(
+            f"Gripper orientation: {'inward' if inward else 'outward'} "
+            f"(yaw -> {yaw_rad:+.2f} rad)"
+        )
 
     def _on_stop(self) -> None:
         self.command_q.put(("stop",))
